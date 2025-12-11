@@ -11,6 +11,7 @@ import {
 import { z } from "zod";
 import archiver from "archiver";
 import OpenAI from "openai";
+import { buildSystemPrompt, buildEnhancePrompt, buildErrorFixPrompt } from "./prompts";
 
 export async function registerRoutes(
   httpServer: Server,
@@ -151,8 +152,16 @@ export async function registerRoutes(
                 baseURL: provider.baseUrl,
               });
 
-              const systemPrompt = getSystemPrompt(mode, session.framework || "paper");
               const previousMessages = await storage.getMessages(session.id);
+              const files = await storage.getFiles(session.id);
+              const compilations = await storage.getCompilations(session.id);
+              
+              const systemPrompt = buildSystemPrompt(mode, {
+                session,
+                files,
+                recentMessages: previousMessages.slice(-10),
+                latestCompilation: compilations[0],
+              });
 
               const response = await openai.chat.completions.create({
                 model: model.name,
@@ -251,8 +260,16 @@ export async function registerRoutes(
                 baseURL: provider.baseUrl,
               });
 
-              const systemPrompt = getSystemPrompt(mode, session.framework || "paper");
               const previousMessages = await storage.getMessages(session.id);
+              const files = await storage.getFiles(session.id);
+              const compilations = await storage.getCompilations(session.id);
+              
+              const systemPrompt = buildSystemPrompt(mode, {
+                session,
+                files,
+                recentMessages: previousMessages.slice(-10),
+                latestCompilation: compilations[0],
+              });
 
               const stream = await openai.chat.completions.create({
                 model: model.name,
@@ -363,18 +380,7 @@ export async function registerRoutes(
                 messages: [
                   {
                     role: "system",
-                    content: `You are a prompt enhancement assistant for AuroraCraft, a Minecraft plugin development platform.
-Your task is to take a user's basic prompt and enhance it into a detailed, well-structured request for creating a Minecraft ${framework || "Paper"} plugin.
-
-Guidelines:
-- Keep the user's core intent intact
-- Add technical specifics like commands, permissions, events to handle
-- Suggest best practices and features they might want
-- Make the prompt clearer and more actionable
-- Format as a natural request, not a list
-- Keep it concise but comprehensive (2-4 sentences max)
-
-Only respond with the enhanced prompt, nothing else.`,
+                    content: buildEnhancePrompt(framework),
                   },
                   { role: "user", content: prompt },
                 ],
@@ -744,57 +750,4 @@ Only respond with the enhanced prompt, nothing else.`,
   });
 
   return httpServer;
-}
-
-function getSystemPrompt(mode: string, framework: string): string {
-  const basePrompt = `You are AuroraCraft, an advanced AI specialized in creating Minecraft plugins using Java 21 and Maven. 
-You have deep expertise in ${framework.toUpperCase()} API and Minecraft server development.
-
-Key capabilities:
-- Generate production-ready Java code for Minecraft plugins
-- Create complete Maven project structures (pom.xml, plugin.yml, etc.)
-- Implement complex features: custom items, GUIs, events, commands, permissions
-- Debug and fix compilation errors
-- Explain code architecture and design patterns
-
-Always:
-- Use Java 21 features appropriately
-- Follow Minecraft plugin best practices
-- Create modular, maintainable code
-- Include proper error handling
-- Add meaningful comments`;
-
-  switch (mode) {
-    case "plan":
-      return `${basePrompt}
-
-MODE: PLANNING
-In this mode, create detailed plans and architecture for the plugin without writing full implementation code.
-- Outline the project structure
-- Define classes and their responsibilities
-- Plan the data flow and event handling
-- Suggest design patterns to use
-- List required dependencies`;
-
-    case "question":
-      return `${basePrompt}
-
-MODE: QUESTION ANSWERING
-In this mode, answer questions about Minecraft plugin development.
-- Explain concepts clearly
-- Provide code examples when helpful
-- Reference official documentation
-- Suggest best practices`;
-
-    default:
-      return `${basePrompt}
-
-MODE: AGENT (Full Implementation)
-In this mode, you are an autonomous agent that creates complete plugins.
-- Generate all necessary files
-- Create working, tested code
-- Think step by step
-- Validate your implementation
-- Stop after completing major phases to ask for confirmation`;
-  }
 }
