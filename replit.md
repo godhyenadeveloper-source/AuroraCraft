@@ -59,9 +59,21 @@ server/           # Express backend
   routes.ts       # API route definitions
   storage.ts      # Database operations
   db.ts           # Drizzle database connection
+  prompts.ts      # AI prompt builder with context-aware system prompts
 shared/           # Shared code between client/server
   schema.ts       # Drizzle database schema
 ```
+
+### AI Prompt System
+The `server/prompts.ts` module provides context-aware prompt generation:
+- **buildSystemPrompt(mode, context)**: Builds comprehensive system prompts with project context (files, messages, compilations)
+- **buildEnhancePrompt(framework)**: Generates prompts for enhancing user requests
+- **buildErrorFixPrompt(errors, files)**: Creates prompts for fixing compilation errors
+
+Three chat modes:
+- **Agent Mode**: Full autonomous implementation with multi-phase workflows
+- **Plan Mode**: Architecture and design without implementation
+- **Question Mode**: Q&A about Minecraft plugin development
 
 ## External Dependencies
 
