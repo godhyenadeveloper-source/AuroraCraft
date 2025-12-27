@@ -562,40 +562,47 @@ function ProvidersSection() {
                 <div>
                   <CardTitle className="text-base">{provider.name}</CardTitle>
                   <CardDescription className="text-xs truncate max-w-48">
-                    {provider.baseUrl}
+                    {provider.authType === "puterjs" ? "User-Pays (no API key)" : provider.baseUrl}
                   </CardDescription>
                 </div>
                 <div className="flex items-center gap-2">
                   <Badge variant={provider.isEnabled ? "default" : "secondary"}>
                     {provider.isEnabled ? "Enabled" : "Disabled"}
                   </Badge>
-                  <DropdownMenu>
-                    <DropdownMenuTrigger asChild>
-                      <Button variant="ghost" size="icon">
-                        <MoreVertical className="w-4 h-4" />
-                      </Button>
-                    </DropdownMenuTrigger>
-                    <DropdownMenuContent align="end">
-                      <DropdownMenuItem onClick={() => setEditingProvider(provider)}>
-                        <Edit2 className="w-4 h-4 mr-2" />
-                        Edit
-                      </DropdownMenuItem>
-                      <DropdownMenuItem
-                        onClick={() => deleteProvider.mutate(provider.id)}
-                        className="text-destructive"
-                      >
-                        <Trash2 className="w-4 h-4 mr-2" />
-                        Delete
-                      </DropdownMenuItem>
-                    </DropdownMenuContent>
-                  </DropdownMenu>
+                  {provider.authType === "puterjs" ? (
+                    <Badge variant="secondary">Built-in</Badge>
+                  ) : (
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button variant="ghost" size="icon">
+                          <MoreVertical className="w-4 h-4" />
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end">
+                        <DropdownMenuItem onClick={() => setEditingProvider(provider)}>
+                          <Edit2 className="w-4 h-4 mr-2" />
+                          Edit
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          onClick={() => deleteProvider.mutate(provider.id)}
+                          className="text-destructive"
+                        >
+                          <Trash2 className="w-4 h-4 mr-2" />
+                          Delete
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  )}
                 </div>
               </CardHeader>
               <CardContent>
                 <div className="flex items-center gap-2 text-sm text-muted-foreground">
                   <Badge variant="outline" className="text-xs">
-                    {provider.authType}
+                    {provider.authType === "puterjs" ? "user-pays" : provider.authType}
                   </Badge>
+                  {provider.authType === "puterjs" && (
+                    <span className="text-xs">No API key required</span>
+                  )}
                 </div>
               </CardContent>
             </Card>
@@ -628,7 +635,10 @@ function ModelsSection() {
     providerId: "",
     name: "",
     displayName: "",
+    description: "",
     tokenCostPerChar: "1",
+    inputCostPerKChar: "0",
+    outputCostPerKChar: "0",
   });
 
   const { data: models, isLoading } = useQuery<Model[]>({
@@ -639,20 +649,34 @@ function ModelsSection() {
     queryKey: ["/api/admin/providers"],
   });
 
+  const selectedProvider = providers?.find((p) => p.id.toString() === formData.providerId);
+  const isPuterProvider = selectedProvider?.authType === "puterjs";
+
   const createModel = useMutation({
     mutationFn: async (data: typeof formData) => {
       return await apiRequest("POST", "/api/admin/models", {
         providerId: parseInt(data.providerId),
         name: data.name,
         displayName: data.displayName,
-        tokenCostPerChar: parseInt(data.tokenCostPerChar),
+        description: data.description || undefined,
+        tokenCostPerChar: parseInt(data.tokenCostPerChar || "0") || 0,
+        inputCostPerKChar: parseInt(data.inputCostPerKChar || "0") || 0,
+        outputCostPerKChar: parseInt(data.outputCostPerKChar || "0") || 0,
       });
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["/api/admin/models"] });
       queryClient.invalidateQueries({ queryKey: ["/api/models"] });
       setIsAddOpen(false);
-      setFormData({ providerId: "", name: "", displayName: "", tokenCostPerChar: "1" });
+      setFormData({
+        providerId: "",
+        name: "",
+        displayName: "",
+        description: "",
+        tokenCostPerChar: "1",
+        inputCostPerKChar: "0",
+        outputCostPerKChar: "0",
+      });
       toast({ title: "Model created" });
     },
   });
@@ -724,12 +748,44 @@ function ModelsSection() {
                   </SelectContent>
                 </Select>
               </div>
+              {isPuterProvider && (
+                <div className="space-y-2">
+                  <Label>Puter.js Model Preset</Label>
+                  <Select
+                    onValueChange={(v) => {
+                      if (v === "claude-sonnet-4-5") {
+                        setFormData((f) => ({
+                          ...f,
+                          name: "claude-sonnet-4-5",
+                          displayName: "Claude Sonnet 4.5",
+                          description: "Claude Sonnet 4.5 via Puter.js",
+                        }));
+                      } else if (v === "claude-opus-4-5") {
+                        setFormData((f) => ({
+                          ...f,
+                          name: "claude-opus-4-5",
+                          displayName: "Claude Opus 4.5",
+                          description: "Claude Opus 4.5 via Puter.js",
+                        }));
+                      }
+                    }}
+                  >
+                    <SelectTrigger>
+                      <SelectValue placeholder="Select Claude model" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="claude-sonnet-4-5">Claude Sonnet 4.5</SelectItem>
+                      <SelectItem value="claude-opus-4-5">Claude Opus 4.5</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              )}
               <div className="space-y-2">
-                <Label>Model Name (API)</Label>
+                <Label>Model ID (API)</Label>
                 <Input
                   value={formData.name}
                   onChange={(e) => setFormData((f) => ({ ...f, name: e.target.value }))}
-                  placeholder="gpt-4"
+                  placeholder={isPuterProvider ? "claude-sonnet-4-5" : "gpt-4"}
                   data-testid="input-model-name"
                 />
               </div>
@@ -743,7 +799,19 @@ function ModelsSection() {
                 />
               </div>
               <div className="space-y-2">
-                <Label>Token Cost (per character)</Label>
+                <Label>Description</Label>
+                <Textarea
+                  value={formData.description}
+                  onChange={(e) => setFormData((f) => ({ ...f, description: e.target.value }))}
+                  placeholder={
+                    isPuterProvider
+                      ? "Claude model via Puter.js (user-pays)"
+                      : "Short description of this model"
+                  }
+                />
+              </div>
+              <div className="space-y-2">
+                <Label>Legacy Token Cost (per character)</Label>
                 <Input
                   type="number"
                   value={formData.tokenCostPerChar}
@@ -751,6 +819,30 @@ function ModelsSection() {
                   placeholder="1"
                   data-testid="input-model-cost"
                 />
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-2">
+                  <Label>Input cost (per 1k characters)</Label>
+                  <Input
+                    type="number"
+                    value={formData.inputCostPerKChar}
+                    onChange={(e) =>
+                      setFormData((f) => ({ ...f, inputCostPerKChar: e.target.value }))
+                    }
+                    placeholder="0"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label>Output cost (per 1k characters)</Label>
+                  <Input
+                    type="number"
+                    value={formData.outputCostPerKChar}
+                    onChange={(e) =>
+                      setFormData((f) => ({ ...f, outputCostPerKChar: e.target.value }))
+                    }
+                    placeholder="0"
+                  />
+                </div>
               </div>
               <Button
                 onClick={() => createModel.mutate(formData)}
@@ -799,12 +891,26 @@ function ModelsSection() {
                       <span className="text-xs text-muted-foreground block font-mono">
                         {model.name}
                       </span>
+                      {model.description && (
+                        <span className="text-xs text-muted-foreground block">
+                          {model.description}
+                        </span>
+                      )}
                     </div>
                   </TableCell>
                   <TableCell>
                     {providers?.find((p) => p.id === model.providerId)?.name || "-"}
                   </TableCell>
-                  <TableCell>{model.tokenCostPerChar}/char</TableCell>
+                  <TableCell>
+                    {model.inputCostPerKChar || model.outputCostPerKChar ? (
+                      <span className="text-xs">
+                        {model.inputCostPerKChar || 0}/1k in, {model.outputCostPerKChar || 0}
+                        /1k out
+                      </span>
+                    ) : (
+                      <span className="text-xs">{model.tokenCostPerChar}/char</span>
+                    )}
+                  </TableCell>
                   <TableCell>
                     <Switch
                       checked={model.isEnabled ?? false}

@@ -49,6 +49,23 @@ export default function Home() {
   const [newProjectName, setNewProjectName] = useState("");
   const [newProjectDescription, setNewProjectDescription] = useState("");
 
+  const logout = useMutation({
+    mutationFn: async () => {
+      return await apiRequest("POST", "/api/auth/logout");
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/auth/user"] });
+      navigate("/");
+    },
+    onError: () => {
+      toast({
+        title: "Error",
+        description: "Failed to sign out",
+        variant: "destructive",
+      });
+    },
+  });
+
   const { data: sessions, isLoading } = useQuery<ChatSession[]>({
     queryKey: ["/api/sessions"],
   });
@@ -92,7 +109,7 @@ export default function Home() {
   });
 
   const handleLogout = () => {
-    window.location.href = "/api/logout";
+    logout.mutate();
   };
 
   const filteredSessions = sessions?.filter((session) =>

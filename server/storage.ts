@@ -28,11 +28,27 @@ import {
   type InsertSiteSetting,
 } from "@shared/schema";
 import { db } from "./db";
-import { eq, desc, and, sql } from "drizzle-orm";
+import { eq, desc, and, ne, or, sql } from "drizzle-orm";
+import { randomBytes, scrypt as scryptCallback } from "crypto";
+import { promisify } from "util";
+
+const scryptAsync = promisify(scryptCallback) as (
+  password: string | Buffer,
+  salt: string | Buffer,
+  keylen: number
+) => Promise<Buffer>;
+
+async function hashPassword(password: string): Promise<string> {
+  const salt = randomBytes(16);
+  const derivedKey = await scryptAsync(password, salt, 64);
+  return `scrypt$${salt.toString("base64")}$${derivedKey.toString("base64")}`;
+}
 
 export interface IStorage {
   // User operations
   getUser(id: string): Promise<User | undefined>;
+  getUserByEmail(email: string): Promise<User | undefined>;
+  getUserByUsername(username: string): Promise<User | undefined>;
   upsertUser(user: UpsertUser): Promise<User>;
   getAllUsers(): Promise<User[]>;
   updateUser(id: string, data: Partial<User>): Promise<User | undefined>;
@@ -47,7 +63,7 @@ export interface IStorage {
 
   // Model operations
   getModels(): Promise<Model[]>;
-  getVisibleModels(): Promise<Model[]>;
+  getVisibleModels(): Promise<(Model & { providerAuthType: string | null })[]>;
   getModel(id: number): Promise<Model | undefined>;
   createModel(data: InsertModel): Promise<Model>;
   updateModel(id: number, data: Partial<InsertModel>): Promise<Model | undefined>;
@@ -99,6 +115,16 @@ export class DatabaseStorage implements IStorage {
   // User operations
   async getUser(id: string): Promise<User | undefined> {
     const [user] = await db.select().from(users).where(eq(users.id, id));
+    return user;
+  }
+
+  async getUserByEmail(email: string): Promise<User | undefined> {
+    const [user] = await db.select().from(users).where(eq(users.email, email));
+    return user;
+  }
+
+  async getUserByUsername(username: string): Promise<User | undefined> {
+    const [user] = await db.select().from(users).where(eq(users.username, username));
     return user;
   }
 
@@ -167,10 +193,24 @@ export class DatabaseStorage implements IStorage {
     return db.select().from(models).orderBy(desc(models.createdAt));
   }
 
-  async getVisibleModels(): Promise<Model[]> {
+  async getVisibleModels(): Promise<(Model & { providerAuthType: string | null })[]> {
     return db
-      .select()
+      .select({
+        id: models.id,
+        providerId: models.providerId,
+        name: models.name,
+        displayName: models.displayName,
+        description: models.description,
+        tokenCostPerChar: models.tokenCostPerChar,
+        inputCostPerKChar: models.inputCostPerKChar,
+        outputCostPerKChar: models.outputCostPerKChar,
+        isEnabled: models.isEnabled,
+        isVisible: models.isVisible,
+        createdAt: models.createdAt,
+        providerAuthType: providers.authType,
+      })
       .from(models)
+      .leftJoin(providers, eq(models.providerId, providers.id))
       .where(and(eq(models.isEnabled, true), eq(models.isVisible, true)));
   }
 
@@ -371,24 +411,189 @@ export const storage = new DatabaseStorage();
 
 export async function seedDefaultAdmin(): Promise<void> {
   try {
-    const existingAdmin = await db
+    const adminId = (process.env.ADMIN_ID || "admin-default").trim();
+    const adminEmail = (process.env.ADMIN_EMAIL || "admin@auroracraft.local")
+      .trim()
+      .toLowerCase();
+    const adminUsername = (process.env.ADMIN_USERNAME || "admin").trim().toLowerCase();
+    const adminPassword =
+      process.env.ADMIN_PASSWORD ||
+      process.env.DEFAULT_ADMIN_PASSWORD ||
+      (process.env.NODE_ENV === "production" ? "" : "adminadmin");
+
+    if (adminEmail && !adminEmail.includes("@")) {
+      throw new Error("ADMIN_EMAIL must be a valid email address");
+    }
+    if (!adminUsername || adminUsername.length < 3) {
+      throw new Error("ADMIN_USERNAME must be at least 3 characters");
+    }
+    if (adminPassword && adminPassword.length < 8) {
+      throw new Error("ADMIN_PASSWORD must be at least 8 characters");
+    }
+
+    const [conflict] = await db
+      .select({ id: users.id })
+      .from(users)
+      .where(
+        and(
+          or(eq(users.email, adminEmail), eq(users.username, adminUsername)),
+          ne(users.id, adminId)
+        )
+      )
+      .limit(1);
+    if (conflict) {
+      throw new Error("ADMIN_EMAIL/ADMIN_USERNAME already belongs to another account");
+    }
+
+    const [existingAdmin] = await db
       .select()
       .from(users)
-      .where(eq(users.email, "admin@auroracraft.local"))
+      .where(eq(users.id, adminId))
       .limit(1);
 
-    if (existingAdmin.length === 0) {
+    if (!existingAdmin && process.env.NODE_ENV === "production" && !adminPassword) {
+      throw new Error(
+        "Missing ADMIN_PASSWORD (or DEFAULT_ADMIN_PASSWORD) for initial admin creation in production"
+      );
+    }
+
+    const passwordHash = adminPassword ? await hashPassword(adminPassword) : null;
+
+    if (!existingAdmin) {
       await db.insert(users).values({
-        id: "admin-default",
-        email: "admin@auroracraft.local",
+        id: adminId,
+        email: adminEmail,
+        username: adminUsername,
+        passwordHash,
         firstName: "Admin",
         lastName: "User",
         isAdmin: true,
         tokenBalance: 100000,
       });
-      console.log("[seed] Created default admin user (admin@auroracraft.local)");
+      console.log(`[seed] Ensured admin user (${adminEmail})`);
+      return;
     }
+
+    const updates: any = {
+      isAdmin: true,
+    };
+    if (adminEmail && existingAdmin.email !== adminEmail) updates.email = adminEmail;
+    if (adminUsername && existingAdmin.username !== adminUsername) updates.username = adminUsername;
+
+    if (process.env.ADMIN_PASSWORD) {
+      updates.passwordHash = passwordHash;
+    } else if (!existingAdmin.passwordHash && passwordHash) {
+      updates.passwordHash = passwordHash;
+    }
+
+    if (Object.keys(updates).length > 0) {
+      await db.update(users).set(updates).where(eq(users.id, existingAdmin.id));
+    }
+    console.log(`[seed] Ensured admin user (${adminEmail})`);
   } catch (error) {
     console.error("[seed] Failed to create default admin:", error);
+  }
+}
+
+export async function seedBuiltInProviders(): Promise<void> {
+  try {
+    const name = "Puter.js";
+    const authType = "puterjs";
+    const baseUrl = "https://js.puter.com/v2/";
+
+    const [existing] = await db
+      .select()
+      .from(providers)
+      .where(or(eq(providers.authType, authType), eq(providers.name, name)))
+      .limit(1);
+
+    if (!existing) {
+      await db.insert(providers).values({
+        name,
+        baseUrl,
+        authType,
+        apiKey: null,
+        customHeaders: null,
+        healthCheckEndpoint: null,
+        defaultPayload: null,
+        isEnabled: true,
+      });
+      console.log(`[seed] Ensured provider (${name})`);
+      return;
+    }
+
+    const updates: any = {};
+    if (existing.name !== name) updates.name = name;
+    if (existing.baseUrl !== baseUrl) updates.baseUrl = baseUrl;
+    if (existing.authType !== authType) updates.authType = authType;
+    if (existing.apiKey) updates.apiKey = null;
+    if (existing.customHeaders) updates.customHeaders = null;
+    if (existing.healthCheckEndpoint) updates.healthCheckEndpoint = null;
+    if (existing.defaultPayload) updates.defaultPayload = null;
+    if (!existing.isEnabled) updates.isEnabled = true;
+
+    if (Object.keys(updates).length > 0) {
+      await db.update(providers).set(updates).where(eq(providers.id, existing.id));
+    }
+
+    console.log(`[seed] Ensured provider (${name})`);
+  } catch (error) {
+    console.error("[seed] Failed to seed providers:", error);
+  }
+}
+
+export async function seedBuiltInModels(): Promise<void> {
+  try {
+    const [puter] = await db
+      .select()
+      .from(providers)
+      .where(eq(providers.authType, "puterjs"))
+      .limit(1);
+
+    if (!puter) {
+      console.warn("[seed] Puter.js provider not found, skipping built-in models");
+      return;
+    }
+
+    const builtInModels = [
+      {
+        name: "claude-sonnet-4-5",
+        displayName: "Claude Sonnet 4.5",
+        description: "Claude Sonnet 4.5 via Puter.js",
+        inputCostPerKChar: 10,
+        outputCostPerKChar: 20,
+      },
+      {
+        name: "claude-opus-4-5",
+        displayName: "Claude Opus 4.5",
+        description: "Claude Opus 4.5 via Puter.js",
+        inputCostPerKChar: 20,
+        outputCostPerKChar: 40,
+      },
+    ];
+
+    for (const m of builtInModels) {
+      const [existing] = await db
+        .select()
+        .from(models)
+        .where(and(eq(models.providerId, puter.id), eq(models.name, m.name)))
+        .limit(1);
+
+      if (!existing) {
+        await db.insert(models).values({
+          providerId: puter.id,
+          name: m.name,
+          displayName: m.displayName,
+          description: m.description,
+          inputCostPerKChar: m.inputCostPerKChar,
+          outputCostPerKChar: m.outputCostPerKChar,
+          isEnabled: true,
+          isVisible: true,
+        });
+        console.log(`[seed] Ensured model (${m.displayName}) for provider (${puter.name})`);
+      }
+    }
+  } catch (error) {
+    console.error("[seed] Failed to seed built-in models:", error);
   }
 }

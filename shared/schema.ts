@@ -13,7 +13,7 @@ import {
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod";
 
-// Session storage table for Replit Auth
+// Session storage table
 export const sessions = pgTable(
   "sessions",
   {
@@ -28,6 +28,8 @@ export const sessions = pgTable(
 export const users = pgTable("users", {
   id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
   email: varchar("email").unique(),
+  username: varchar("username").unique(),
+  passwordHash: text("password_hash"),
   firstName: varchar("first_name"),
   lastName: varchar("last_name"),
   profileImageUrl: varchar("profile_image_url"),
@@ -57,7 +59,10 @@ export const models = pgTable("models", {
   providerId: integer("provider_id").references(() => providers.id),
   name: varchar("name").notNull(),
   displayName: varchar("display_name").notNull(),
+  description: text("description"),
   tokenCostPerChar: integer("token_cost_per_char").default(1),
+  inputCostPerKChar: integer("input_cost_per_kchar").default(0),
+  outputCostPerKChar: integer("output_cost_per_kchar").default(0),
   isEnabled: boolean("is_enabled").default(true),
   isVisible: boolean("is_visible").default(true),
   createdAt: timestamp("created_at").defaultNow(),

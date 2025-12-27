@@ -83,6 +83,8 @@ interface FileTreeItem {
   content?: string;
 }
 
+type VisibleModel = Model & { providerAuthType?: string | null };
+
 function buildFileTree(files: ProjectFile[]): FileTreeItem[] {
   const root: FileTreeItem[] = [];
   const folders: Map<string, FileTreeItem> = new Map();
@@ -263,7 +265,7 @@ export default function ChatPage() {
     enabled: !!sessionId,
   });
 
-  const { data: models } = useQuery<Model[]>({
+  const { data: models } = useQuery<VisibleModel[]>({
     queryKey: ["/api/models"],
   });
 
@@ -271,6 +273,89 @@ export default function ChatPage() {
     queryKey: ["/api/sessions", sessionId, "compilations"],
     enabled: !!sessionId,
   });
+
+  const sendMessageWithPuter = async (
+    content: string,
+    model: VisibleModel | undefined,
+    abortController: AbortController
+  ) => {
+    const anyWindow = window as any;
+    const puter = anyWindow?.puter;
+
+    if (!puter?.ai?.chat) {
+      throw new Error("Puter.js is not available. Make sure the Puter.js script is loaded.");
+    }
+
+    // Persist user message first so it appears in history
+    await apiRequest("POST", `/api/sessions/${sessionId}/messages`, {
+      role: "user",
+      content,
+      modelId: selectedModel ? parseInt(selectedModel) : undefined,
+    });
+
+    // Build system prompt with full server-side context
+    const systemPromptResponse = await apiRequest(
+      "POST",
+      `/api/sessions/${sessionId}/system-prompt`,
+      { mode }
+    );
+    const systemPromptData = await systemPromptResponse.json();
+    const systemPrompt: string | undefined = systemPromptData.systemPrompt;
+
+    const history = (messages || []).slice(-20).map((m) => ({
+      role: m.role === "assistant" ? "assistant" : "user",
+      content: m.content,
+    }));
+
+    const chatMessages: { role: string; content: string }[] = [];
+    if (systemPrompt) {
+      chatMessages.push({ role: "system", content: systemPrompt });
+    }
+    chatMessages.push(...history);
+    chatMessages.push({ role: "user", content });
+
+    const stream = await puter.ai.chat(chatMessages, false, {
+      stream: true,
+      model: model?.name,
+    });
+
+    let fullText = "";
+    for await (const part of stream as any) {
+      if (abortController.signal.aborted) break;
+      const text = part?.text || "";
+      if (!text) continue;
+      fullText += text;
+      setStreamingContent((prev) => prev + text);
+    }
+
+    if (!abortController.signal.aborted && fullText) {
+      let tokensUsed = 0;
+      try {
+        const usageResponse = await apiRequest("POST", "/api/token-usage/apply", {
+          sessionId,
+          modelId: model?.id,
+          inputChars: content.length,
+          outputChars: fullText.length,
+          action: "chat",
+        });
+        const usageData = await usageResponse.json();
+        tokensUsed = usageData.tokensUsed || 0;
+      } catch (e) {
+        // Token accounting failure should not break chat UX
+      }
+
+      await apiRequest("POST", `/api/sessions/${sessionId}/messages`, {
+        role: "assistant",
+        content: fullText,
+        modelId: selectedModel ? parseInt(selectedModel) : undefined,
+        tokensUsed,
+      });
+
+      queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "messages"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "files"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/auth/user"] });
+    }
+  };
 
   const sendMessageStreaming = async (content: string) => {
     setIsStreaming(true);
@@ -281,6 +366,14 @@ export default function ChatPage() {
     abortControllerRef.current = abortController;
 
     try {
+      const selectedModelObj = models?.find((m) => m.id.toString() === selectedModel);
+      const isPuterModel = selectedModelObj?.providerAuthType === "puterjs";
+
+      if (isPuterModel) {
+        await sendMessageWithPuter(content, selectedModelObj, abortController);
+        return;
+      }
+
       const response = await fetch(`/api/sessions/${sessionId}/chat/stream`, {
         method: "POST",
         headers: {

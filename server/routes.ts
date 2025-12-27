@@ -1,7 +1,7 @@
 import type { Express } from "express";
 import type { Server } from "http";
 import { storage } from "./storage";
-import { setupAuth, isAuthenticated, isAdmin } from "./replitAuth";
+import { setupAuth, isAuthenticated, isAdmin } from "./auth";
 import {
   insertChatSessionSchema,
   insertProviderSchema,
@@ -12,6 +12,42 @@ import { z } from "zod";
 import archiver from "archiver";
 import OpenAI from "openai";
 import { buildSystemPrompt, buildEnhancePrompt, buildErrorFixPrompt } from "./prompts";
+
+function isBuiltInProvider(provider: any): boolean {
+  return provider?.authType === "puterjs";
+}
+
+function computeTokenUsageFromChars(
+  model: any,
+  inputChars: number,
+  outputChars: number
+): number {
+  if (!model) return 0;
+
+  const inputRate =
+    typeof model.inputCostPerKChar === "number" && model.inputCostPerKChar > 0
+      ? model.inputCostPerKChar
+      : typeof model.tokenCostPerChar === "number"
+      ? model.tokenCostPerChar
+      : 0;
+
+  const outputRate =
+    typeof model.outputCostPerKChar === "number" && model.outputCostPerKChar > 0
+      ? model.outputCostPerKChar
+      : typeof model.tokenCostPerChar === "number"
+      ? model.tokenCostPerChar
+      : 0;
+
+  const safeInputChars = Number.isFinite(inputChars) && inputChars > 0 ? inputChars : 0;
+  const safeOutputChars = Number.isFinite(outputChars) && outputChars > 0 ? outputChars : 0;
+
+  const inputTokens =
+    inputRate > 0 ? Math.round((safeInputChars / 1000) * inputRate) : 0;
+  const outputTokens =
+    outputRate > 0 ? Math.round((safeOutputChars / 1000) * outputRate) : 0;
+
+  return inputTokens + outputTokens;
+}
 
 export async function registerRoutes(
   httpServer: Server,
@@ -25,12 +61,12 @@ export async function registerRoutes(
       if (!req.isAuthenticated || !req.isAuthenticated()) {
         return res.json(null);
       }
-      const userId = req.user?.claims?.sub;
-      if (!userId) {
+      const user = req.user as any;
+      if (!user?.id) {
         return res.json(null);
       }
-      const user = await storage.getUser(userId);
-      res.json(user);
+      const { passwordHash: _ph, ...safeUser } = user;
+      res.json(safeUser);
     } catch (error) {
       console.error("Error fetching user:", error);
       res.status(500).json({ message: "Failed to fetch user" });
@@ -51,7 +87,7 @@ export async function registerRoutes(
   // Sessions
   app.get("/api/sessions", isAuthenticated, async (req: any, res) => {
     try {
-      const userId = req.user.claims.sub;
+      const userId = req.user.id;
       const sessions = await storage.getSessions(userId);
       res.json(sessions);
     } catch (error) {
@@ -63,7 +99,7 @@ export async function registerRoutes(
   app.get("/api/sessions/:id", isAuthenticated, async (req: any, res) => {
     try {
       const session = await storage.getSession(parseInt(req.params.id));
-      if (!session || session.userId !== req.user.claims.sub) {
+      if (!session || session.userId !== req.user.id) {
         return res.status(404).json({ message: "Session not found" });
       }
       res.json(session);
@@ -75,7 +111,7 @@ export async function registerRoutes(
 
   app.post("/api/sessions", isAuthenticated, async (req: any, res) => {
     try {
-      const userId = req.user.claims.sub;
+      const userId = req.user.id;
       const data = insertChatSessionSchema.parse({
         ...req.body,
         userId,
@@ -91,7 +127,7 @@ export async function registerRoutes(
   app.delete("/api/sessions/:id", isAuthenticated, async (req: any, res) => {
     try {
       const session = await storage.getSession(parseInt(req.params.id));
-      if (!session || session.userId !== req.user.claims.sub) {
+      if (!session || session.userId !== req.user.id) {
         return res.status(404).json({ message: "Session not found" });
       }
       await storage.deleteSession(session.id);
@@ -106,7 +142,7 @@ export async function registerRoutes(
   app.get("/api/sessions/:id/messages", isAuthenticated, async (req: any, res) => {
     try {
       const session = await storage.getSession(parseInt(req.params.id));
-      if (!session || session.userId !== req.user.claims.sub) {
+      if (!session || session.userId !== req.user.id) {
         return res.status(404).json({ message: "Session not found" });
       }
       const messages = await storage.getMessages(session.id);
@@ -117,16 +153,75 @@ export async function registerRoutes(
     }
   });
 
+  app.post("/api/sessions/:id/messages", isAuthenticated, async (req: any, res) => {
+    try {
+      const session = await storage.getSession(parseInt(req.params.id));
+      if (!session || session.userId !== req.user.id) {
+        return res.status(404).json({ message: "Session not found" });
+      }
+
+      const { role, content, modelId, tokensUsed } = req.body;
+
+      if (!role || !content || typeof content !== "string") {
+        return res.status(400).json({ message: "role and content are required" });
+      }
+
+      if (role !== "user" && role !== "assistant" && role !== "system") {
+        return res.status(400).json({ message: "Invalid role" });
+      }
+
+      const message = await storage.createMessage({
+        sessionId: session.id,
+        role,
+        content,
+        modelId: modelId || null,
+        tokensUsed: typeof tokensUsed === "number" ? tokensUsed : 0,
+      });
+
+      res.json(message);
+    } catch (error) {
+      console.error("Error creating message:", error);
+      res.status(500).json({ message: "Failed to create message" });
+    }
+  });
+
+  app.post("/api/sessions/:id/system-prompt", isAuthenticated, async (req: any, res) => {
+    try {
+      const session = await storage.getSession(parseInt(req.params.id));
+      if (!session || session.userId !== req.user.id) {
+        return res.status(404).json({ message: "Session not found" });
+      }
+
+      const { mode } = req.body;
+
+      const files = await storage.getFiles(session.id);
+      const compilations = await storage.getCompilations(session.id);
+      const previousMessages = await storage.getMessages(session.id);
+
+      const systemPrompt = buildSystemPrompt(mode || session.mode || "agent", {
+        session,
+        files,
+        recentMessages: previousMessages.slice(-10),
+        latestCompilation: compilations[0],
+      });
+
+      res.json({ systemPrompt });
+    } catch (error) {
+      console.error("Error building system prompt:", error);
+      res.status(500).json({ message: "Failed to build system prompt" });
+    }
+  });
+
   // Chat with AI
   app.post("/api/sessions/:id/chat", isAuthenticated, async (req: any, res) => {
     try {
       const session = await storage.getSession(parseInt(req.params.id));
-      if (!session || session.userId !== req.user.claims.sub) {
+      if (!session || session.userId !== req.user.id) {
         return res.status(404).json({ message: "Session not found" });
       }
 
       const { content, mode, modelId } = req.body;
-      const userId = req.user.claims.sub;
+      const userId = req.user.id;
 
       // Save user message
       await storage.createMessage({
@@ -136,12 +231,13 @@ export async function registerRoutes(
         modelId: modelId || null,
       });
 
-      // Get model and provider
       let aiResponse = "I understand you want to create a Minecraft plugin. Let me help you with that.";
-      let tokensUsed = content.length;
+      let tokensUsed = 0;
+      let modelForUsage: any | undefined;
 
       if (modelId) {
         const model = await storage.getModel(modelId);
+        modelForUsage = model;
         if (model && model.providerId) {
           const provider = await storage.getProvider(model.providerId);
           if (provider && provider.apiKey) {
@@ -177,13 +273,18 @@ export async function registerRoutes(
               });
 
               aiResponse = response.choices[0]?.message?.content || aiResponse;
-              tokensUsed = (response.usage?.total_tokens || content.length) * (model.tokenCostPerChar || 1);
             } catch (aiError) {
               console.error("AI error:", aiError);
               aiResponse = "I encountered an error processing your request. Please try again.";
             }
           }
         }
+      }
+
+      if (modelForUsage) {
+        const inputChars = typeof content === "string" ? content.length : 0;
+        const outputChars = aiResponse ? aiResponse.length : 0;
+        tokensUsed = computeTokenUsageFromChars(modelForUsage, inputChars, outputChars);
       }
 
       // Save assistant message
@@ -197,7 +298,7 @@ export async function registerRoutes(
 
       // Deduct tokens from user
       const user = await storage.getUser(userId);
-      if (user) {
+      if (user && tokensUsed > 0) {
         await storage.updateUser(userId, {
           tokenBalance: Math.max(0, (user.tokenBalance || 0) - tokensUsed),
         });
@@ -225,12 +326,12 @@ export async function registerRoutes(
   app.post("/api/sessions/:id/chat/stream", isAuthenticated, async (req: any, res) => {
     try {
       const session = await storage.getSession(parseInt(req.params.id));
-      if (!session || session.userId !== req.user.claims.sub) {
+      if (!session || session.userId !== req.user.id) {
         return res.status(404).json({ message: "Session not found" });
       }
 
       const { content, mode, modelId } = req.body;
-      const userId = req.user.claims.sub;
+      const userId = req.user.id;
 
       // Save user message
       await storage.createMessage({
@@ -247,10 +348,12 @@ export async function registerRoutes(
       res.setHeader("X-Accel-Buffering", "no");
 
       let fullResponse = "";
-      let tokensUsed = content.length;
+      let tokensUsed = 0;
+      let modelForUsage: any | undefined;
 
       if (modelId) {
         const model = await storage.getModel(modelId);
+        modelForUsage = model;
         if (model && model.providerId) {
           const provider = await storage.getProvider(model.providerId);
           if (provider && provider.apiKey) {
@@ -291,9 +394,6 @@ export async function registerRoutes(
                   fullResponse += text;
                   res.write(`data: ${JSON.stringify({ type: "chunk", content: text })}\n\n`);
                 }
-                if (chunk.usage) {
-                  tokensUsed = (chunk.usage.total_tokens || content.length) * (model.tokenCostPerChar || 1);
-                }
               }
             } catch (aiError) {
               console.error("AI streaming error:", aiError);
@@ -309,6 +409,12 @@ export async function registerRoutes(
         res.write(`data: ${JSON.stringify({ type: "chunk", content: fullResponse })}\n\n`);
       }
 
+      if (modelForUsage) {
+        const inputChars = typeof content === "string" ? content.length : 0;
+        const outputChars = fullResponse ? fullResponse.length : 0;
+        tokensUsed = computeTokenUsageFromChars(modelForUsage, inputChars, outputChars);
+      }
+
       // Save assistant message
       const assistantMessage = await storage.createMessage({
         sessionId: session.id,
@@ -320,7 +426,7 @@ export async function registerRoutes(
 
       // Deduct tokens from user
       const user = await storage.getUser(userId);
-      if (user) {
+      if (user && tokensUsed > 0) {
         await storage.updateUser(userId, {
           tokenBalance: Math.max(0, (user.tokenBalance || 0) - tokensUsed),
         });
@@ -355,7 +461,7 @@ export async function registerRoutes(
   app.post("/api/enhance-prompt", isAuthenticated, async (req: any, res) => {
     try {
       const { prompt, modelId, framework } = req.body;
-      const userId = req.user.claims.sub;
+      const userId = req.user.id;
 
       if (!prompt || prompt.trim().length === 0) {
         return res.status(400).json({ message: "Prompt is required" });
@@ -388,7 +494,10 @@ export async function registerRoutes(
               });
 
               enhancedPrompt = response.choices[0]?.message?.content || prompt;
-              tokensUsed = (response.usage?.total_tokens || 0) * (model.tokenCostPerChar || 1);
+
+              const inputChars = typeof prompt === "string" ? prompt.length : 0;
+              const outputChars = enhancedPrompt ? enhancedPrompt.length : 0;
+              tokensUsed = computeTokenUsageFromChars(model, inputChars, outputChars);
             } catch (aiError) {
               console.error("AI error in enhance:", aiError);
             }
@@ -425,7 +534,7 @@ export async function registerRoutes(
   app.get("/api/sessions/:id/files", isAuthenticated, async (req: any, res) => {
     try {
       const session = await storage.getSession(parseInt(req.params.id));
-      if (!session || session.userId !== req.user.claims.sub) {
+      if (!session || session.userId !== req.user.id) {
         return res.status(404).json({ message: "Session not found" });
       }
       const files = await storage.getFiles(session.id);
@@ -439,7 +548,7 @@ export async function registerRoutes(
   app.post("/api/sessions/:id/files", isAuthenticated, async (req: any, res) => {
     try {
       const session = await storage.getSession(parseInt(req.params.id));
-      if (!session || session.userId !== req.user.claims.sub) {
+      if (!session || session.userId !== req.user.id) {
         return res.status(404).json({ message: "Session not found" });
       }
 
@@ -463,7 +572,7 @@ export async function registerRoutes(
       }
 
       const session = await storage.getSession(file.sessionId!);
-      if (!session || session.userId !== req.user.claims.sub) {
+      if (!session || session.userId !== req.user.id) {
         return res.status(404).json({ message: "File not found" });
       }
 
@@ -483,7 +592,7 @@ export async function registerRoutes(
       }
 
       const session = await storage.getSession(file.sessionId!);
-      if (!session || session.userId !== req.user.claims.sub) {
+      if (!session || session.userId !== req.user.id) {
         return res.status(404).json({ message: "File not found" });
       }
 
@@ -499,7 +608,7 @@ export async function registerRoutes(
   app.get("/api/sessions/:id/download", isAuthenticated, async (req: any, res) => {
     try {
       const session = await storage.getSession(parseInt(req.params.id));
-      if (!session || session.userId !== req.user.claims.sub) {
+      if (!session || session.userId !== req.user.id) {
         return res.status(404).json({ message: "Session not found" });
       }
 
@@ -531,7 +640,7 @@ export async function registerRoutes(
   app.get("/api/sessions/:id/compilations", isAuthenticated, async (req: any, res) => {
     try {
       const session = await storage.getSession(parseInt(req.params.id));
-      if (!session || session.userId !== req.user.claims.sub) {
+      if (!session || session.userId !== req.user.id) {
         return res.status(404).json({ message: "Session not found" });
       }
       const compilations = await storage.getCompilations(session.id);
@@ -545,7 +654,7 @@ export async function registerRoutes(
   app.post("/api/sessions/:id/compile", isAuthenticated, async (req: any, res) => {
     try {
       const session = await storage.getSession(parseInt(req.params.id));
-      if (!session || session.userId !== req.user.claims.sub) {
+      if (!session || session.userId !== req.user.id) {
         return res.status(404).json({ message: "Session not found" });
       }
 
@@ -593,7 +702,7 @@ export async function registerRoutes(
   app.get("/api/admin/users", isAuthenticated, isAdmin, async (req, res) => {
     try {
       const users = await storage.getAllUsers();
-      res.json(users);
+      res.json(users.map(({ passwordHash: _ph, ...u }: any) => u));
     } catch (error) {
       console.error("Error fetching users:", error);
       res.status(500).json({ message: "Failed to fetch users" });
@@ -603,7 +712,9 @@ export async function registerRoutes(
   app.patch("/api/admin/users/:id", isAuthenticated, isAdmin, async (req, res) => {
     try {
       const user = await storage.updateUser(req.params.id, req.body);
-      res.json(user);
+      if (!user) return res.status(404).json({ message: "User not found" });
+      const { passwordHash: _ph, ...safeUser } = user as any;
+      res.json(safeUser);
     } catch (error) {
       console.error("Error updating user:", error);
       res.status(500).json({ message: "Failed to update user" });
@@ -634,6 +745,9 @@ export async function registerRoutes(
   app.post("/api/admin/providers", isAuthenticated, isAdmin, async (req, res) => {
     try {
       const data = insertProviderSchema.parse(req.body);
+      if (data.authType === "puterjs" || data.name === "Puter.js") {
+        return res.status(400).json({ message: "This provider is built-in" });
+      }
       const provider = await storage.createProvider(data);
       res.json(provider);
     } catch (error) {
@@ -644,8 +758,21 @@ export async function registerRoutes(
 
   app.patch("/api/admin/providers/:id", isAuthenticated, isAdmin, async (req, res) => {
     try {
-      const provider = await storage.updateProvider(parseInt(req.params.id), req.body);
-      res.json(provider);
+      const providerId = parseInt(req.params.id);
+      const existing = await storage.getProvider(providerId);
+      if (!existing) {
+        return res.status(404).json({ message: "Provider not found" });
+      }
+      if (isBuiltInProvider(existing)) {
+        return res.status(403).json({ message: "This provider cannot be edited" });
+      }
+
+      if (req.body?.authType === "puterjs" || req.body?.name === "Puter.js") {
+        return res.status(400).json({ message: "This provider identity is reserved" });
+      }
+
+      const updated = await storage.updateProvider(providerId, req.body);
+      res.json(updated);
     } catch (error) {
       console.error("Error updating provider:", error);
       res.status(500).json({ message: "Failed to update provider" });
@@ -654,7 +781,15 @@ export async function registerRoutes(
 
   app.delete("/api/admin/providers/:id", isAuthenticated, isAdmin, async (req, res) => {
     try {
-      await storage.deleteProvider(parseInt(req.params.id));
+      const providerId = parseInt(req.params.id);
+      const existing = await storage.getProvider(providerId);
+      if (!existing) {
+        return res.status(404).json({ message: "Provider not found" });
+      }
+      if (isBuiltInProvider(existing)) {
+        return res.status(403).json({ message: "This provider cannot be deleted" });
+      }
+      await storage.deleteProvider(providerId);
       res.json({ success: true });
     } catch (error) {
       console.error("Error deleting provider:", error);
@@ -740,12 +875,60 @@ export async function registerRoutes(
   // Token usage history for current user
   app.get("/api/token-usage", isAuthenticated, async (req: any, res) => {
     try {
-      const userId = req.user.claims.sub;
+      const userId = req.user.id;
       const usage = await storage.getUserTokenUsage(userId);
       res.json(usage);
     } catch (error) {
       console.error("Error fetching token usage:", error);
       res.status(500).json({ message: "Failed to fetch token usage" });
+    }
+  });
+
+  // Generic token usage application (used by client-side providers like Puter.js)
+  app.post("/api/token-usage/apply", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.id;
+      const { sessionId, modelId, inputChars, outputChars, action } = req.body;
+
+      if (!modelId) {
+        return res.status(400).json({ message: "modelId is required" });
+      }
+
+      const model = await storage.getModel(modelId);
+      if (!model) {
+        return res.status(404).json({ message: "Model not found" });
+      }
+
+      const tokensUsed = computeTokenUsageFromChars(
+        model,
+        typeof inputChars === "number" ? inputChars : 0,
+        typeof outputChars === "number" ? outputChars : 0
+      );
+
+      if (!tokensUsed || tokensUsed <= 0) {
+        return res.json({ tokensUsed: 0 });
+      }
+
+      const user = await storage.getUser(userId);
+      if (!user) {
+        return res.status(404).json({ message: "User not found" });
+      }
+
+      const newBalance = Math.max(0, (user.tokenBalance || 0) - tokensUsed);
+      await storage.updateUser(userId, { tokenBalance: newBalance });
+
+      await storage.createTokenUsage({
+        userId,
+        sessionId: typeof sessionId === "number" ? sessionId : null,
+        modelId,
+        action: action || "chat",
+        tokensUsed,
+      });
+
+      res.json({ tokensUsed, tokenBalance: newBalance });
+    } catch (error) {
+      console.error("Error applying token usage:", error);
+      res.status(500).json({ message: "Failed to apply token usage" });
     }
   });
 
