@@ -23,7 +23,7 @@ Preferred communication style: Simple, everyday language.
 - **HTTP Server**: Node.js native HTTP server wrapping Express
 - **API Pattern**: RESTful JSON APIs under `/api` prefix
 - **Session Management**: Express sessions with PostgreSQL session store (connect-pg-simple)
-- **Authentication**: Replit OpenID Connect (OIDC) via Passport.js
+- **Authentication**: Local username/email/password authentication via Passport.js
 
 ### Database Layer
 - **Database**: PostgreSQL
@@ -83,7 +83,7 @@ Three chat modes:
 - Custom provider system allowing admin-configured AI endpoints
 
 ### Authentication
-- **Replit OIDC**: Primary authentication via `openid-client` and Passport.js
+- Local username/email/password authentication
 - Session persistence in PostgreSQL
 
 ### Database
@@ -96,5 +96,3 @@ Three chat modes:
 ### Environment Variables Required
 - `DATABASE_URL`: PostgreSQL connection string
 - `SESSION_SECRET`: Express session secret
-- `REPL_ID`: Replit environment identifier
-- `ISSUER_URL`: OIDC issuer (defaults to Replit)

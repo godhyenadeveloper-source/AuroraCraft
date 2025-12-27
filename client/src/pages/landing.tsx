@@ -1,7 +1,24 @@
 import { useState } from "react";
+import { useMutation } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  Tabs,
+  TabsContent,
+  TabsList,
+  TabsTrigger,
+} from "@/components/ui/tabs";
+import { useToast } from "@/hooks/use-toast";
+import { apiRequest, queryClient } from "@/lib/queryClient";
 import { 
   Blocks, 
   MessageSquare, 
@@ -46,13 +63,155 @@ const features = [
 export default function Landing() {
   const [prompt, setPrompt] = useState("");
   const [selectedType, setSelectedType] = useState("minecraft");
+  const [authOpen, setAuthOpen] = useState(false);
+  const [identifier, setIdentifier] = useState("");
+  const [password, setPassword] = useState("");
+  const [email, setEmail] = useState("");
+  const [username, setUsername] = useState("");
+  const { toast } = useToast();
 
   const handleLogin = () => {
-    window.location.href = "/api/login";
+    setAuthOpen(true);
   };
+
+  const login = useMutation({
+    mutationFn: async () => {
+      const res = await apiRequest("POST", "/api/auth/login", {
+        identifier,
+        password,
+      });
+      return res.json();
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/auth/user"] });
+      setAuthOpen(false);
+    },
+    onError: (error: any) => {
+      toast({
+        title: "Sign in failed",
+        description: error?.message || "Invalid credentials",
+        variant: "destructive",
+      });
+    },
+  });
+
+  const register = useMutation({
+    mutationFn: async () => {
+      const res = await apiRequest("POST", "/api/auth/register", {
+        email: email || null,
+        username,
+        password,
+      });
+      return res.json();
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/auth/user"] });
+      setAuthOpen(false);
+    },
+    onError: (error: any) => {
+      toast({
+        title: "Registration failed",
+        description: error?.message || "Unable to create account",
+        variant: "destructive",
+      });
+    },
+  });
 
   return (
     <div className="min-h-screen bg-background">
+      <Dialog open={authOpen} onOpenChange={setAuthOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Welcome</DialogTitle>
+          </DialogHeader>
+
+          <Tabs defaultValue="login">
+            <TabsList className="grid grid-cols-2">
+              <TabsTrigger value="login">Sign In</TabsTrigger>
+              <TabsTrigger value="register">Create Account</TabsTrigger>
+            </TabsList>
+
+            <TabsContent value="login" className="space-y-4">
+              <div className="space-y-2">
+                <Label htmlFor="login-identifier">Email or Username</Label>
+                <Input
+                  id="login-identifier"
+                  value={identifier}
+                  onChange={(e) => setIdentifier(e.target.value)}
+                  autoComplete="username"
+                  data-testid="input-login-identifier"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="login-password">Password</Label>
+                <Input
+                  id="login-password"
+                  type="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  autoComplete="current-password"
+                  data-testid="input-login-password"
+                />
+              </div>
+              <Button
+                className="w-full"
+                onClick={() => login.mutate()}
+                disabled={login.isPending || !identifier.trim() || password.length < 1}
+                data-testid="button-login-submit"
+              >
+                Sign In
+              </Button>
+            </TabsContent>
+
+            <TabsContent value="register" className="space-y-4">
+              <div className="space-y-2">
+                <Label htmlFor="register-username">Username</Label>
+                <Input
+                  id="register-username"
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  autoComplete="username"
+                  data-testid="input-register-username"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="register-email">Email (optional)</Label>
+                <Input
+                  id="register-email"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  autoComplete="email"
+                  data-testid="input-register-email"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="register-password">Password</Label>
+                <Input
+                  id="register-password"
+                  type="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  autoComplete="new-password"
+                  data-testid="input-register-password"
+                />
+              </div>
+              <Button
+                className="w-full"
+                onClick={() => register.mutate()}
+                disabled={
+                  register.isPending ||
+                  username.trim().length < 3 ||
+                  password.length < 8
+                }
+                data-testid="button-register-submit"
+              >
+                Create Account
+              </Button>
+            </TabsContent>
+          </Tabs>
+        </DialogContent>
+      </Dialog>
+
       <nav className="fixed top-0 left-0 right-0 z-50 border-b border-border/40 bg-background/80 backdrop-blur-xl">
         <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between gap-4">
           <div className="flex items-center gap-3">
