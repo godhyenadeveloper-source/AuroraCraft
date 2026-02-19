@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useReducer } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { useRoute, useLocation, Link } from "wouter";
 import { useAuth } from "@/hooks/useAuth";
@@ -44,6 +44,20 @@ import { Label } from "@/components/ui/label";
 import { useToast } from "@/hooks/use-toast";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { CodeEditor, getLanguageFromFilename } from "@/components/code-editor";
+import { MarkdownRenderer } from "@/components/markdown-renderer";
+import {
+  BuildPlanMessage,
+  PhaseBubble,
+  BuildThinkingIndicator,
+  BuildSummaryMessage,
+  BuildErrorMessage,
+} from "@/components/build-messages";
+import {
+  runBuild,
+  buildReducer,
+  INITIAL_BUILD_STATE,
+  type BuildEvent,
+} from "@/lib/build-engine";
 import type { ChatSession, ChatMessage, Model, ProjectFile, Compilation } from "@shared/schema";
 import {
   ArrowLeft,
@@ -241,6 +255,10 @@ export default function ChatPage() {
   const [editorContent, setEditorContent] = useState("");
   const [streamingContent, setStreamingContent] = useState("");
   const abortControllerRef = useRef<AbortController | null>(null);
+
+  // Build engine state
+  const [buildState, dispatchBuild] = useReducer(buildReducer, INITIAL_BUILD_STATE);
+  const isBuildActive = buildState.status !== "idle" && buildState.status !== "complete" && buildState.status !== "error" && buildState.status !== "cancelled";
 
   const [isNewFileDialogOpen, setIsNewFileDialogOpen] = useState(false);
   const [newFileName, setNewFileName] = useState("");
@@ -632,7 +650,56 @@ export default function ChatPage() {
   };
 
   const handleSend = () => {
-    if (!message.trim() || isStreaming) return;
+    if (!message.trim() || isStreaming || isBuildActive) return;
+
+    // In agent mode, use the build engine for full agentic builds
+    if (mode === "agent") {
+      const selectedModelObj = models?.find((m) => m.id.toString() === selectedModel);
+      if (!selectedModelObj) {
+        toast({ title: "Error", description: "Please select a model", variant: "destructive" });
+        return;
+      }
+
+      const userMessage = message;
+      setMessage("");
+      setIsStreaming(true);
+
+      const abortController = new AbortController();
+      abortControllerRef.current = abortController;
+
+      dispatchBuild({ type: "planning" });
+
+      runBuild({
+        userRequest: userMessage,
+        sessionId: sessionId!,
+        model: selectedModelObj,
+        framework: session?.framework || "paper",
+        onEvent: (event: BuildEvent) => {
+          dispatchBuild(event);
+          // On conversation response (non-build), refresh messages to show it
+          if (event.type === "conversation-response" || event.type === "build-complete") {
+            queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "messages"] });
+            queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "files"] });
+            queryClient.invalidateQueries({ queryKey: ["/api/auth/user"] });
+          }
+          // Refresh file tree after each file creation
+          if (event.type === "file-created" || event.type === "file-updated") {
+            queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "files"] });
+          }
+        },
+        signal: abortController.signal,
+      }).finally(() => {
+        setIsStreaming(false);
+        abortControllerRef.current = null;
+        queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "messages"] });
+        queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "files"] });
+        queryClient.invalidateQueries({ queryKey: ["/api/auth/user"] });
+      });
+
+      return;
+    }
+
+    // For plan/question modes, use existing streaming chat
     sendMessageStreaming(message);
   };
 
@@ -777,7 +844,11 @@ export default function ChatPage() {
                             : "bg-card border border-card-border"
                         }`}
                       >
-                        <p className="text-sm whitespace-pre-wrap">{msg.content}</p>
+                        {msg.role === "assistant" ? (
+                          <MarkdownRenderer content={msg.content} className="text-sm" />
+                        ) : (
+                          <p className="text-sm whitespace-pre-wrap">{msg.content}</p>
+                        )}
                       </div>
                       {msg.role === "user" && (
                         <div className="w-8 h-8 rounded-full bg-accent flex items-center justify-center shrink-0">
@@ -787,17 +858,46 @@ export default function ChatPage() {
                     </div>
                   ))
                 )}
-                {isStreaming && (
+
+                {/* Build engine UI — phases, badges, progress */}
+                {buildState.plan && buildState.status !== "idle" && (
+                  <>
+                    <BuildPlanMessage plan={buildState.plan} />
+                    {buildState.phases.map((phase, i) => (
+                      phase.status !== "pending" && (
+                        <PhaseBubble key={i} phase={phase} phaseIndex={i} />
+                      )
+                    ))}
+                  </>
+                )}
+
+                {/* Build summary */}
+                {buildState.status === "complete" && buildState.summary && (
+                  <BuildSummaryMessage content={buildState.summary} />
+                )}
+
+                {/* Build error */}
+                {buildState.status === "error" && buildState.error && (
+                  <BuildErrorMessage error={buildState.error} />
+                )}
+
+                {/* Build thinking indicator */}
+                {isBuildActive && buildState.thinkingMessage && (
+                  <BuildThinkingIndicator message={buildState.thinkingMessage} />
+                )}
+
+                {/* Streaming message for plan/question modes */}
+                {isStreaming && !isBuildActive && (
                   <div className="flex gap-3" data-testid="message-streaming">
                     <div className="w-8 h-8 rounded-full bg-primary flex items-center justify-center shrink-0">
                       <Bot className="w-4 h-4 text-primary-foreground animate-pulse" />
                     </div>
                     <div className="max-w-[85%] rounded-xl px-4 py-3 bg-card border border-card-border">
-                      <p className="text-sm whitespace-pre-wrap">
-                        {streamingContent || (
-                          <span className="text-muted-foreground">Thinking...</span>
-                        )}
-                      </p>
+                      {streamingContent ? (
+                        <MarkdownRenderer content={streamingContent} className="text-sm" />
+                      ) : (
+                        <p className="text-sm text-muted-foreground">Thinking...</p>
+                      )}
                     </div>
                   </div>
                 )}
@@ -839,7 +939,9 @@ export default function ChatPage() {
               <div className="relative">
                 <Textarea
                   placeholder={
-                    mode === "agent"
+                    isBuildActive
+                      ? "Build in progress..."
+                      : mode === "agent"
                       ? "Describe what you want to build..."
                       : mode === "plan"
                       ? "Describe the plugin architecture..."
@@ -854,13 +956,14 @@ export default function ChatPage() {
                     }
                   }}
                   className="min-h-24 pr-12 resize-none"
+                  disabled={isBuildActive}
                   data-testid="input-message"
                 />
                 <Button
                   size="icon"
                   className="absolute bottom-3 right-3"
                   onClick={isStreaming ? stopStreaming : handleSend}
-                  disabled={!message.trim() && !isStreaming}
+                  disabled={!message.trim() && !isStreaming && !isBuildActive}
                   variant={isStreaming ? "destructive" : "default"}
                   data-testid="button-send"
                 >
