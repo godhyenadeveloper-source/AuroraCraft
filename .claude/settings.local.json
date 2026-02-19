@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pnpm add:*)",
+      "Bash(npx tsc:*)",
+      "Bash(timeout 15 pnpm dev:*)",
+      "Bash(psql:*)",
+      "Bash(pg_lsclusters:*)",
+      "Bash(dpkg:*)",
+      "Bash(sudo sh -c 'echo \"\"deb http://apt.postgresql.org/pub/repos/apt $\\(lsb_release -cs\\)-pgdg main\"\" > /etc/apt/sources.list.d/pgdg.list')",
+      "Bash(curl:*)",
+      "Bash(sudo gpg:*)",
+      "Bash(sudo apt-get:*)",
+      "Bash(sudo pg_ctlcluster 17 main start)"
+    ]
+  }
+}

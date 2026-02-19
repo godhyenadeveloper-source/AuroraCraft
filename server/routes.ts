@@ -932,5 +932,87 @@ export async function registerRoutes(
     }
   });
 
+  // Lightweight AI generate proxy — streams AI responses via SSE.
+  // Does NOT save messages, does NOT deduct tokens. The build engine handles that.
+  app.post("/api/ai/generate", isAuthenticated, async (req: any, res) => {
+    try {
+      const { modelId, systemPrompt, messages, maxTokens } = req.body;
+
+      if (!modelId || !systemPrompt) {
+        return res.status(400).json({ message: "modelId and systemPrompt are required" });
+      }
+
+      const model = await storage.getModel(modelId);
+      if (!model || !model.providerId) {
+        return res.status(404).json({ message: "Model not found" });
+      }
+
+      const provider = await storage.getProvider(model.providerId);
+      if (!provider || !provider.apiKey) {
+        return res.status(400).json({ message: "Provider not configured or missing API key" });
+      }
+
+      // Set up SSE headers
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+      res.setHeader("X-Accel-Buffering", "no");
+
+      try {
+        const openai = new OpenAI({
+          apiKey: provider.apiKey,
+          baseURL: provider.baseUrl,
+        });
+
+        const chatMessages = [
+          { role: "system" as const, content: systemPrompt },
+          ...(messages || []).map((m: any) => ({
+            role: m.role as "user" | "assistant",
+            content: m.content,
+          })),
+        ];
+
+        const inputChars = chatMessages.reduce((sum, m) => sum + m.content.length, 0);
+
+        const stream = await openai.chat.completions.create({
+          model: model.name,
+          messages: chatMessages,
+          max_completion_tokens: maxTokens || 4096,
+          stream: true,
+        });
+
+        let outputChars = 0;
+        let finishReason = "";
+
+        for await (const chunk of stream) {
+          const text = chunk.choices[0]?.delta?.content || "";
+          if (text) {
+            outputChars += text.length;
+            res.write(`data: ${JSON.stringify({ type: "chunk", content: text })}\n\n`);
+          }
+          if (chunk.choices[0]?.finish_reason) {
+            finishReason = chunk.choices[0].finish_reason;
+          }
+        }
+
+        res.write(`data: ${JSON.stringify({ type: "done", inputChars, outputChars, finishReason })}\n\n`);
+        res.end();
+      } catch (aiError) {
+        console.error("AI generate error:", aiError);
+        if (!res.headersSent) {
+          res.status(500).json({ message: "AI generation failed" });
+        } else {
+          res.write(`data: ${JSON.stringify({ type: "error", content: "AI generation failed" })}\n\n`);
+          res.end();
+        }
+      }
+    } catch (error) {
+      console.error("Error in /api/ai/generate:", error);
+      if (!res.headersSent) {
+        res.status(500).json({ message: "Failed to generate AI response" });
+      }
+    }
+  });
+
   return httpServer;
 }
