@@ -1,0 +1,6 @@
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://go.trybons.ai",
+    "ANTHROPIC_AUTH_TOKEN": "bonsai_api_key"
+  }
+}
