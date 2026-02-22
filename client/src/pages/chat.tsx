@@ -51,15 +51,21 @@ import {
   BuildThinkingIndicator,
   BuildSummaryMessage,
   BuildErrorMessage,
+  BuildInterruptedMessage,
+  BuildFileErrorActions,
 } from "@/components/build-messages";
 import {
   runBuild,
+  resumeBuild,
   buildReducer,
   INITIAL_BUILD_STATE,
   type BuildEvent,
+  type BuildState,
+  type BuildPlan,
 } from "@/lib/build-engine";
 import type { ChatSession, ChatMessage, Model, ProjectFile, Compilation } from "@shared/schema";
 import {
+  AlertCircle,
   ArrowLeft,
   Send,
   Square,
@@ -86,6 +92,7 @@ import {
   FilePlus,
   FolderPlus,
   MoreVertical,
+  Pause,
 } from "lucide-react";
 
 interface FileTreeItem {
@@ -238,6 +245,61 @@ function FileTreeNode({
   );
 }
 
+// ─── Build state persistence helpers ──────────────────────────────────────
+
+const BUILD_STATE_KEY = (sid: number) => `auroracraft-build-${sid}`;
+
+function saveBuildState(sid: number, state: BuildState): void {
+  try {
+    localStorage.setItem(BUILD_STATE_KEY(sid), JSON.stringify(state));
+  } catch {
+    // localStorage full or unavailable — non-fatal
+  }
+}
+
+function loadBuildState(sid: number): BuildState | null {
+  try {
+    const raw = localStorage.getItem(BUILD_STATE_KEY(sid));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as BuildState;
+    // Plan was awaiting approval — restore as-is so the UI shows action buttons
+    if (parsed.status === "awaiting-approval") {
+      return parsed;
+    }
+    // If build was mid-flight, mark as interrupted (pipeline cannot resume)
+    if (["planning", "building", "reviewing"].includes(parsed.status)) {
+      let errorMsg = "Build interrupted by page refresh. Files created before the interruption are preserved.";
+      // Check for saved file error context
+      try {
+        const fileErrorRaw = localStorage.getItem(`auroracraft-file-error-${sid}`);
+        if (fileErrorRaw) {
+          const { filePath, error } = JSON.parse(fileErrorRaw);
+          errorMsg = `Build interrupted while generating ${filePath}: ${error}. Files created before the interruption are preserved.`;
+        }
+      } catch {}
+      return {
+        ...parsed,
+        status: "error",
+        error: errorMsg,
+        thinkingMessage: null,
+      };
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function clearBuildState(sid: number): void {
+  try {
+    localStorage.removeItem(BUILD_STATE_KEY(sid));
+  } catch {
+    // ignore
+  }
+  // Also clear server-side build plan (fire-and-forget)
+  apiRequest("PATCH", `/api/sessions/${sid}`, { buildPlan: null, buildStatus: "idle" }).catch(() => {});
+}
+
 export default function ChatPage() {
   const [, params] = useRoute("/chat/:id");
   const [, navigate] = useLocation();
@@ -256,9 +318,31 @@ export default function ChatPage() {
   const [streamingContent, setStreamingContent] = useState("");
   const abortControllerRef = useRef<AbortController | null>(null);
 
-  // Build engine state
-  const [buildState, dispatchBuild] = useReducer(buildReducer, INITIAL_BUILD_STATE);
-  const isBuildActive = buildState.status !== "idle" && buildState.status !== "complete" && buildState.status !== "error" && buildState.status !== "cancelled";
+  // Server-side build tracking
+  const [activeBuildId, setActiveBuildId] = useState<number | null>(null);
+  // Stores the last server build id for error/cancelled builds (without triggering SSE)
+  const lastServerBuildIdRef = useRef<number | null>(null);
+
+  // Build engine state — restored from localStorage on mount
+  const [buildState, dispatchBuild] = useReducer(
+    buildReducer,
+    sessionId,
+    (sid) => (sid ? loadBuildState(sid) : null) || INITIAL_BUILD_STATE,
+  );
+  const isBuildActive = !["idle", "complete", "error", "cancelled", "awaiting-approval"].includes(buildState.status);
+
+  // Plan confirmation state — holds a Promise resolver that the build engine awaits
+  const [pendingPlanConfirm, setPendingPlanConfirm] = useState<{
+    plan: BuildPlan;
+    resolve: (result: { action: 'approve' | 'edit' | 'cancel'; editInstructions?: string }) => void;
+  } | null>(null);
+
+  // File error state — holds a Promise resolver for retry/cancel decision
+  const [pendingFileError, setPendingFileError] = useState<{
+    filePath: string;
+    error: string;
+    resolve: (decision: 'retry' | 'cancel') => void;
+  } | null>(null);
 
   const [isNewFileDialogOpen, setIsNewFileDialogOpen] = useState(false);
   const [newFileName, setNewFileName] = useState("");
@@ -291,6 +375,159 @@ export default function ChatPage() {
     queryKey: ["/api/sessions", sessionId, "compilations"],
     enabled: !!sessionId,
   });
+
+  // Restore build plan from server if localStorage has no state
+  useEffect(() => {
+    if (!session || !sessionId) return;
+    const sessionAny = session as any;
+    if (sessionAny.buildPlan && sessionAny.buildStatus === "awaiting-approval" && buildState.status === "idle") {
+      const plan = sessionAny.buildPlan as BuildPlan;
+      dispatchBuild({ type: "plan-ready", plan });
+    }
+  }, [session, sessionId, buildState.status]);
+
+  // Check for active server-side build on mount
+  useEffect(() => {
+    if (!sessionId) return;
+    apiRequest("GET", `/api/sessions/${sessionId}/builds/current`)
+      .then((res) => res.json())
+      .then((build) => {
+        if (build && build.id) {
+          if (!["complete", "error", "cancelled"].includes(build.status)) {
+            // Active build — reconnect via SSE
+            setActiveBuildId(build.id);
+            setIsStreaming(true);
+          } else if (["error", "cancelled"].includes(build.status)) {
+            // Interrupted build — restore state for possible resume
+            // Do NOT set activeBuildId here: that triggers SSE which sends
+            // "done" immediately (no runner) and clears the restored state.
+            // Store the build id in a ref so resume can find it.
+            lastServerBuildIdRef.current = build.id;
+            if (build.plan && build.phases) {
+              dispatchBuild({
+                type: "snapshot",
+                state: {
+                  status: "error",
+                  plan: build.plan,
+                  phases: build.phases,
+                  error: build.error || "Build interrupted. Click Resume to continue.",
+                  thinkingMessage: null,
+                  summary: null,
+                },
+              });
+            }
+          }
+        }
+      })
+      .catch(() => {});
+  }, [sessionId]);
+
+  // SSE subscription for server-side build events
+  useEffect(() => {
+    if (!activeBuildId) return;
+
+    const eventSource = new EventSource(`/api/builds/${activeBuildId}/stream`);
+    // Track the last snapshot status so "done" knows whether to clear state
+    let lastSnapshotStatus: string | null = null;
+
+    eventSource.onmessage = (e) => {
+      try {
+        const event = JSON.parse(e.data);
+        if (event.type === "done") {
+          queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "messages"] });
+          queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "files"] });
+          queryClient.invalidateQueries({ queryKey: ["/api/auth/user"] });
+          // Only clear build state if the build actually completed successfully.
+          // If the snapshot showed an error/cancelled state, preserve it so the
+          // user can see the error and resume.
+          if (lastSnapshotStatus === "complete") {
+            if (sessionId) {
+              clearBuildState(sessionId);
+            }
+          }
+          eventSource.close();
+          setActiveBuildId(null);
+          setIsStreaming(false);
+          return;
+        }
+        dispatchBuild(event);
+
+        // Track snapshot status
+        if (event.type === "snapshot" && event.state) {
+          lastSnapshotStatus = event.state.status;
+          // Restore pending file error from snapshot (survives page refresh)
+          if (event.state.pendingFileError) {
+            setPendingFileError({
+              filePath: event.state.pendingFileError.filePath,
+              error: event.state.pendingFileError.error,
+              resolve: () => {}, // Server-side builds use API calls, not promise resolve
+            });
+          }
+        }
+
+        // If snapshot shows build already completed, refresh and close
+        if (event.type === "snapshot" && event.state && ["complete", "cancelled"].includes(event.state.status)) {
+          queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "messages"] });
+          queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "files"] });
+          queryClient.invalidateQueries({ queryKey: ["/api/auth/user"] });
+          if (sessionId) {
+            clearBuildState(sessionId);
+          }
+          setActiveBuildId(null);
+          setIsStreaming(false);
+          eventSource.close();
+          return;
+        }
+
+        // Refresh queries on key events
+        if (event.type === "file-created" || event.type === "file-updated" || event.type === "file-deleted") {
+          queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "files"] });
+        }
+        if (event.type === "build-complete" || event.type === "conversation-response") {
+          if (sessionId) {
+            clearBuildState(sessionId);
+            try { localStorage.removeItem(`auroracraft-file-error-${sessionId}`); } catch {}
+          }
+          queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "messages"] });
+          queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "files"] });
+          queryClient.invalidateQueries({ queryKey: ["/api/auth/user"] });
+          setActiveBuildId(null);
+          setIsStreaming(false);
+          eventSource.close();
+        }
+        if (event.type === "build-error") {
+          setIsStreaming(false);
+          // Keep activeBuildId so resume can find the server build
+          eventSource.close();
+        }
+        // Show file error UI for server-side file errors
+        if (event.type === "file-error" && event.error) {
+          const filePath = buildState.phases[event.phaseIndex]?.files[event.fileIndex]?.path || "unknown file";
+          setPendingFileError({
+            filePath,
+            error: event.error,
+            resolve: () => {}, // Server-side builds use API calls, not promise resolve
+          });
+        }
+        // Clear file error UI when file is retried/created
+        if (event.type === "file-generating" || event.type === "file-updating" || event.type === "file-reading") {
+          setPendingFileError(null);
+        }
+      } catch {}
+    };
+
+    eventSource.onerror = () => {
+      // SSE connection lost — build continues server-side
+      // Close this source; the activeBuildId remains set so on
+      // re-render or manual action the user can reconnect
+      eventSource.close();
+      setIsStreaming(false);
+    };
+
+    return () => {
+      eventSource.close();
+    };
+  }, [activeBuildId, sessionId]);
 
   const sendMessageWithPuter = async (
     content: string,
@@ -380,6 +617,20 @@ export default function ChatPage() {
     setStreamingContent("");
     setMessage("");
 
+    // Optimistically add user message to cache so it appears immediately
+    queryClient.setQueryData<ChatMessage[]>(
+      ["/api/sessions", sessionId, "messages"],
+      (old) => [...(old || []), {
+        id: -Date.now(),
+        sessionId: sessionId!,
+        role: "user",
+        content,
+        modelId: selectedModel ? parseInt(selectedModel) : null,
+        tokensUsed: 0,
+        createdAt: new Date(),
+      } as ChatMessage],
+    );
+
     const abortController = new AbortController();
     abortControllerRef.current = abortController;
 
@@ -463,6 +714,13 @@ export default function ChatPage() {
   };
 
   const stopStreaming = () => {
+    if (activeBuildId) {
+      // Cancel server-side build
+      apiRequest("POST", `/api/builds/${activeBuildId}/cancel`).catch(() => {});
+      setActiveBuildId(null);
+      setIsStreaming(false);
+      dispatchBuild({ type: "build-error", error: "Build was cancelled" });
+    }
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
     }
@@ -620,7 +878,26 @@ export default function ChatPage() {
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+  }, [messages, buildState, streamingContent]);
+
+  // Persist build state to localStorage on every change
+  useEffect(() => {
+    if (sessionId && buildState.status !== "idle") {
+      saveBuildState(sessionId, buildState);
+    }
+  }, [sessionId, buildState]);
+
+  // Persist file error context so it survives refresh
+  useEffect(() => {
+    if (sessionId && pendingFileError) {
+      try {
+        localStorage.setItem(
+          `auroracraft-file-error-${sessionId}`,
+          JSON.stringify({ filePath: pendingFileError.filePath, error: pendingFileError.error })
+        );
+      } catch {}
+    }
+  }, [sessionId, pendingFileError]);
 
   useEffect(() => {
     if (models?.length && !selectedModel) {
@@ -649,8 +926,150 @@ export default function ChatPage() {
     });
   };
 
+  const handleResumeBuild = () => {
+    const selectedModelObj = models?.find((m) => m.id.toString() === selectedModel);
+    if (!selectedModelObj) {
+      toast({ title: "Error", description: "Please select a model", variant: "destructive" });
+      return;
+    }
+
+    const isPuter = selectedModelObj.providerAuthType === "puterjs";
+
+    // For non-Puter models with a server-side build, use server resume
+    const serverBuildId = activeBuildId || lastServerBuildIdRef.current;
+    if (!isPuter && serverBuildId) {
+      dispatchBuild({ type: "planning" });
+      setIsStreaming(true);
+      setActiveBuildId(serverBuildId);
+      lastServerBuildIdRef.current = null;
+
+      apiRequest("POST", `/api/builds/${serverBuildId}/resume`).then((res) => res.json()).then((data) => {
+        // SSE subscription effect handles the rest
+      }).catch((err) => {
+        dispatchBuild({ type: "build-error", error: err.message || "Failed to resume build" });
+        setIsStreaming(false);
+      });
+      return;
+    }
+
+    // For non-Puter models without an activeBuildId, check server for interrupted build
+    if (!isPuter && sessionId) {
+      dispatchBuild({ type: "planning" });
+      setIsStreaming(true);
+
+      apiRequest("GET", `/api/sessions/${sessionId}/builds/current`).then((res) => res.json()).then((build) => {
+        if (build && build.id && ["error", "cancelled"].includes(build.status)) {
+          setActiveBuildId(build.id);
+          return apiRequest("POST", `/api/builds/${build.id}/resume`).then((res) => res.json());
+        } else {
+          // No server build to resume — fall through to client-side
+          throw new Error("no-server-build");
+        }
+      }).catch((err) => {
+        if (err.message === "no-server-build") {
+          // Fall through to client-side resume below
+          setIsStreaming(false);
+          resumeBuildClientSide(selectedModelObj);
+        } else {
+          dispatchBuild({ type: "build-error", error: err.message || "Failed to resume build" });
+          setIsStreaming(false);
+        }
+      });
+      return;
+    }
+
+    // Puter.js or fallback: client-side resume
+    resumeBuildClientSide(selectedModelObj);
+  };
+
+  const resumeBuildClientSide = (selectedModelObj: VisibleModel) => {
+    setIsStreaming(true);
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
+
+    const buildEventHandler = (event: BuildEvent) => {
+      dispatchBuild(event);
+      if (event.type === "conversation-response" || event.type === "build-complete") {
+        if (sessionId) {
+          clearBuildState(sessionId);
+          try { localStorage.removeItem(`auroracraft-file-error-${sessionId}`); } catch {}
+        }
+        queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "messages"] });
+        queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "files"] });
+        queryClient.invalidateQueries({ queryKey: ["/api/auth/user"] });
+      }
+      if (event.type === "file-created" || event.type === "file-updated") {
+        queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "files"] });
+      }
+    };
+
+    const fileErrorHandler = (filePath: string, error: string) => {
+      return new Promise<'retry' | 'cancel'>((resolve) => {
+        setPendingFileError({ filePath, error, resolve });
+      });
+    };
+
+    // If we have an existing plan and phases, do a true resume (skip planning)
+    if (buildState.plan && buildState.phases.length > 0) {
+      resumeBuild({
+        plan: buildState.plan,
+        phases: buildState.phases,
+        sessionId: sessionId!,
+        model: selectedModelObj,
+        framework: session?.framework || "paper",
+        onEvent: buildEventHandler,
+        signal: abortController.signal,
+        onFileError: fileErrorHandler,
+      }).finally(() => {
+        setIsStreaming(false);
+        abortControllerRef.current = null;
+        setPendingPlanConfirm(null);
+        setPendingFileError(null);
+        queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "messages"] });
+        queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "files"] });
+        queryClient.invalidateQueries({ queryKey: ["/api/auth/user"] });
+      });
+    } else {
+      // Fallback: no plan available, start a fresh build with resume context
+      let resumeContext: string | undefined;
+      const completedFiles = buildState.phases
+        .flatMap(p => p.files.filter(f => f.status === "created" || f.status === "updated"))
+        .map(f => f.path);
+      if (completedFiles.length > 0) {
+        resumeContext = `The following files were already created in a previous build attempt and exist in the project:\n${completedFiles.map(f => `- ${f}`).join("\n")}\nDo NOT regenerate these files unless the user specifically requests changes to them.`;
+      }
+      const userRequest = "Continue the previous build";
+
+      dispatchBuild({ type: "planning" });
+
+      runBuild({
+        userRequest,
+        sessionId: sessionId!,
+        model: selectedModelObj,
+        framework: session?.framework || "paper",
+        resumeContext,
+        onEvent: buildEventHandler,
+        signal: abortController.signal,
+        onPlanConfirm: (plan) => {
+          return new Promise<{ action: 'approve' | 'edit' | 'cancel'; editInstructions?: string }>((resolve) => {
+            setPendingPlanConfirm({ plan, resolve });
+          });
+        },
+        onFileError: fileErrorHandler,
+      }).finally(() => {
+        setIsStreaming(false);
+        abortControllerRef.current = null;
+        setPendingPlanConfirm(null);
+        setPendingFileError(null);
+        queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "messages"] });
+        queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "files"] });
+        queryClient.invalidateQueries({ queryKey: ["/api/auth/user"] });
+      });
+    }
+  };
+
   const handleSend = () => {
-    if (!message.trim() || isStreaming || isBuildActive) return;
+    if (!message.trim() || isStreaming || isBuildActive || buildState.status === "awaiting-approval") return;
 
     // In agent mode, use the build engine for full agentic builds
     if (mode === "agent") {
@@ -662,10 +1081,60 @@ export default function ChatPage() {
 
       const userMessage = message;
       setMessage("");
+
+      // Optimistically add user message to cache so it appears immediately
+      queryClient.setQueryData<ChatMessage[]>(
+        ["/api/sessions", sessionId, "messages"],
+        (old) => [...(old || []), {
+          id: -Date.now(),
+          sessionId: sessionId!,
+          role: "user",
+          content: userMessage,
+          modelId: selectedModelObj.id,
+          tokensUsed: 0,
+          createdAt: new Date(),
+        } as ChatMessage],
+      );
+
+      const isPuter = selectedModelObj.providerAuthType === "puterjs";
+
+      // For non-Puter models, use server-side builds (persistent across page close)
+      if (!isPuter) {
+        dispatchBuild({ type: "planning" });
+        setIsStreaming(true);
+
+        apiRequest("POST", `/api/sessions/${sessionId}/builds`, {
+          userRequest: userMessage,
+          modelId: selectedModelObj.id,
+        }).then((res) => res.json()).then((data) => {
+          if (data.buildId) {
+            setActiveBuildId(data.buildId);
+            // SSE subscription effect will handle the rest
+          }
+        }).catch((err) => {
+          dispatchBuild({ type: "build-error", error: err.message || "Failed to start build" });
+          setIsStreaming(false);
+        });
+
+        return;
+      }
+
+      // Puter.js models: use client-side build pipeline (cannot run server-side)
       setIsStreaming(true);
 
       const abortController = new AbortController();
       abortControllerRef.current = abortController;
+
+      // Build resume context from interrupted build state
+      let resumeContext: string | undefined;
+      if (buildState.status === "error" && buildState.plan) {
+        const completedFiles = buildState.phases
+          .flatMap(p => p.files.filter(f => f.status === "created" || f.status === "updated"))
+          .map(f => f.path);
+        if (completedFiles.length > 0) {
+          resumeContext = `The following files were already created in a previous build attempt and exist in the project:\n${completedFiles.map(f => `- ${f}`).join("\n")}\nDo NOT regenerate these files unless the user specifically requests changes to them.`;
+        }
+      }
 
       dispatchBuild({ type: "planning" });
 
@@ -674,23 +1143,38 @@ export default function ChatPage() {
         sessionId: sessionId!,
         model: selectedModelObj,
         framework: session?.framework || "paper",
+        resumeContext,
         onEvent: (event: BuildEvent) => {
           dispatchBuild(event);
-          // On conversation response (non-build), refresh messages to show it
           if (event.type === "conversation-response" || event.type === "build-complete") {
+            if (sessionId) {
+              clearBuildState(sessionId);
+              try { localStorage.removeItem(`auroracraft-file-error-${sessionId}`); } catch {}
+            }
             queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "messages"] });
             queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "files"] });
             queryClient.invalidateQueries({ queryKey: ["/api/auth/user"] });
           }
-          // Refresh file tree after each file creation
-          if (event.type === "file-created" || event.type === "file-updated") {
+          if (event.type === "file-created" || event.type === "file-updated" || event.type === "file-deleted") {
             queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "files"] });
           }
         },
         signal: abortController.signal,
+        onPlanConfirm: (plan) => {
+          return new Promise<{ action: 'approve' | 'edit' | 'cancel'; editInstructions?: string }>((resolve) => {
+            setPendingPlanConfirm({ plan, resolve });
+          });
+        },
+        onFileError: (filePath, error) => {
+          return new Promise<'retry' | 'cancel'>((resolve) => {
+            setPendingFileError({ filePath, error, resolve });
+          });
+        },
       }).finally(() => {
         setIsStreaming(false);
         abortControllerRef.current = null;
+        setPendingPlanConfirm(null);
+        setPendingFileError(null);
         queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "messages"] });
         queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "files"] });
         queryClient.invalidateQueries({ queryKey: ["/api/auth/user"] });
@@ -826,7 +1310,14 @@ export default function ChatPage() {
                     </p>
                   </div>
                 ) : (
-                  messages?.map((msg) => (
+                  messages?.filter((msg) => {
+                    // Filter out plan summary message when build plan card is showing (Fix #6)
+                    if (buildState.plan && buildState.status !== "idle" && buildState.status !== "complete" &&
+                        msg.role === "assistant" && msg.content.startsWith(`**Build Plan: ${buildState.plan.pluginName}**`)) {
+                      return false;
+                    }
+                    return true;
+                  }).map((msg) => (
                     <div
                       key={msg.id}
                       className={`flex gap-3 ${msg.role === "user" ? "justify-end" : ""}`}
@@ -862,8 +1353,45 @@ export default function ChatPage() {
                 {/* Build engine UI — phases, badges, progress */}
                 {buildState.plan && buildState.status !== "idle" && (
                   <>
-                    <BuildPlanMessage plan={buildState.plan} />
-                    {buildState.phases.map((phase, i) => (
+                    <BuildPlanMessage
+                      plan={buildState.plan}
+                      showActions={!!pendingPlanConfirm || buildState.status === "awaiting-approval"}
+                      onConfirm={() => {
+                        if (activeBuildId) {
+                          // Server-side build: approve via API
+                          apiRequest("POST", `/api/builds/${activeBuildId}/approve`, { action: "approve" }).catch(() => {});
+                        } else if (pendingPlanConfirm) {
+                          pendingPlanConfirm.resolve({ action: 'approve' });
+                          setPendingPlanConfirm(null);
+                        } else {
+                          // Post-refresh: start a new build with this plan
+                          handleResumeBuild();
+                        }
+                      }}
+                      onCancel={() => {
+                        if (activeBuildId) {
+                          // Server-side build: cancel via API
+                          apiRequest("POST", `/api/builds/${activeBuildId}/approve`, { action: "cancel" }).catch(() => {});
+                          setActiveBuildId(null);
+                          dispatchBuild({ type: "conversation-response", content: "" });
+                          if (sessionId) clearBuildState(sessionId);
+                        } else if (pendingPlanConfirm) {
+                          pendingPlanConfirm.resolve({ action: 'cancel' });
+                          setPendingPlanConfirm(null);
+                        } else {
+                          dispatchBuild({ type: "conversation-response", content: "" });
+                          if (sessionId) clearBuildState(sessionId);
+                        }
+                      }}
+                      onEdit={pendingPlanConfirm ? (instructions) => {
+                        pendingPlanConfirm.resolve({ action: 'edit', editInstructions: instructions });
+                        setPendingPlanConfirm(null);
+                      } : activeBuildId ? (instructions) => {
+                        apiRequest("POST", `/api/builds/${activeBuildId}/approve`, { action: "edit", editInstructions: instructions }).catch(() => {});
+                      } : undefined}
+                    />
+                    {/* Phases render only after plan is confirmed */}
+                    {!pendingPlanConfirm && buildState.status !== "awaiting-approval" && buildState.phases.map((phase, i) => (
                       phase.status !== "pending" && (
                         <PhaseBubble key={i} phase={phase} phaseIndex={i} />
                       )
@@ -871,14 +1399,59 @@ export default function ChatPage() {
                   </>
                 )}
 
+                {/* File error with retry/cancel buttons */}
+                {pendingFileError && (
+                  <BuildFileErrorActions
+                    filePath={pendingFileError.filePath}
+                    error={pendingFileError.error}
+                    onRetry={() => {
+                      if (activeBuildId) {
+                        apiRequest("POST", `/api/builds/${activeBuildId}/file-error-decision`, { decision: "retry" }).catch(() => {});
+                      } else {
+                        pendingFileError.resolve('retry');
+                      }
+                      setPendingFileError(null);
+                    }}
+                    onCancel={() => {
+                      if (activeBuildId) {
+                        apiRequest("POST", `/api/builds/${activeBuildId}/file-error-decision`, { decision: "cancel" }).catch(() => {});
+                      } else {
+                        pendingFileError.resolve('cancel');
+                      }
+                      setPendingFileError(null);
+                    }}
+                  />
+                )}
+
                 {/* Build summary */}
                 {buildState.status === "complete" && buildState.summary && (
                   <BuildSummaryMessage content={buildState.summary} />
                 )}
 
-                {/* Build error */}
+                {/* Build error / interrupted */}
                 {buildState.status === "error" && buildState.error && (
-                  <BuildErrorMessage error={buildState.error} />
+                  buildState.error.includes("interrupted") ? (
+                    <BuildInterruptedMessage
+                      error={buildState.error}
+                      completedFiles={
+                        buildState.phases.flatMap(p =>
+                          p.files.filter(f => f.status === "created" || f.status === "updated").map(f => f.path)
+                        )
+                      }
+                      onResume={() => {
+                        handleResumeBuild();
+                      }}
+                      onDismiss={() => {
+                        dispatchBuild({ type: "conversation-response", content: "" });
+                        if (sessionId) {
+                          clearBuildState(sessionId);
+                          try { localStorage.removeItem(`auroracraft-file-error-${sessionId}`); } catch {}
+                        }
+                      }}
+                    />
+                  ) : (
+                    <BuildErrorMessage error={buildState.error} />
+                  )
                 )}
 
                 {/* Build thinking indicator */}
@@ -886,8 +1459,16 @@ export default function ChatPage() {
                   <BuildThinkingIndicator message={buildState.thinkingMessage} />
                 )}
 
+                {/* Puter.js client-side build warning */}
+                {isBuildActive && !activeBuildId && (
+                  <div className="flex items-center gap-2 rounded-lg px-3 py-2 bg-yellow-500/10 border border-yellow-500/20 text-xs text-yellow-600 dark:text-yellow-400">
+                    <AlertCircle className="w-3 h-3 shrink-0" />
+                    <span>This build runs in your browser. Closing or refreshing the page will interrupt it.</span>
+                  </div>
+                )}
+
                 {/* Streaming message for plan/question modes */}
-                {isStreaming && !isBuildActive && (
+                {isStreaming && !isBuildActive && buildState.status === "idle" && (
                   <div className="flex gap-3" data-testid="message-streaming">
                     <div className="w-8 h-8 rounded-full bg-primary flex items-center justify-center shrink-0">
                       <Bot className="w-4 h-4 text-primary-foreground animate-pulse" />
@@ -939,7 +1520,7 @@ export default function ChatPage() {
               <div className="relative">
                 <Textarea
                   placeholder={
-                    isBuildActive
+                    isBuildActive || buildState.status === "awaiting-approval"
                       ? "Build in progress..."
                       : mode === "agent"
                       ? "Describe what you want to build..."
@@ -956,23 +1537,33 @@ export default function ChatPage() {
                     }
                   }}
                   className="min-h-24 pr-12 resize-none"
-                  disabled={isBuildActive}
+                  disabled={isBuildActive || buildState.status === "awaiting-approval"}
                   data-testid="input-message"
                 />
-                <Button
-                  size="icon"
-                  className="absolute bottom-3 right-3"
-                  onClick={isStreaming ? stopStreaming : handleSend}
-                  disabled={!message.trim() && !isStreaming && !isBuildActive}
-                  variant={isStreaming ? "destructive" : "default"}
-                  data-testid="button-send"
-                >
-                  {isStreaming ? (
-                    <Square className="w-4 h-4" />
-                  ) : (
-                    <Send className="w-4 h-4" />
-                  )}
-                </Button>
+                {(() => {
+                  const isBuildPaused = isStreaming && (!!pendingPlanConfirm || !!pendingFileError);
+                  const isAwaitingApproval = buildState.status === "awaiting-approval" && !isStreaming;
+                  return (
+                    <Button
+                      size="icon"
+                      className="absolute bottom-3 right-3"
+                      onClick={isStreaming ? stopStreaming : handleSend}
+                      disabled={isAwaitingApproval || (!message.trim() && !isStreaming && !isBuildActive)}
+                      variant={isAwaitingApproval ? "secondary" : isBuildPaused ? "secondary" : isStreaming ? "destructive" : "default"}
+                      data-testid="button-send"
+                    >
+                      {isAwaitingApproval ? (
+                        <Pause className="w-4 h-4" />
+                      ) : isBuildPaused ? (
+                        <Pause className="w-4 h-4" />
+                      ) : isStreaming ? (
+                        <Square className="w-4 h-4" />
+                      ) : (
+                        <Send className="w-4 h-4" />
+                      )}
+                    </Button>
+                  );
+                })()}
               </div>
             </div>
           </div>

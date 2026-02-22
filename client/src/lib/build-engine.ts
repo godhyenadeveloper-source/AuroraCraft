@@ -13,10 +13,13 @@ import { apiRequest } from "./queryClient";
 import {
   buildPlanningPrompt,
   buildFileGenerationPrompt,
+  buildPatchPrompt,
   buildReviewPrompt,
   buildSummaryPrompt,
   buildContinuationPrompt,
-} from "./build-prompts";
+  buildFileReadPrompt,
+  buildAgenticStepPrompt,
+} from "@shared/build-prompts";
 
 // ─── Types ───────────────────────────────────────────────────────────────
 
@@ -50,13 +53,15 @@ export interface FileState {
   path: string;
   name: string;
   description: string;
-  status: "pending" | "generating" | "created" | "updating" | "updated" | "error";
+  status: "pending" | "generating" | "created" | "updating" | "updated"
+        | "reading" | "read" | "deleting" | "deleted" | "error";
   error?: string;
 }
 
 export type BuildStatus =
   | "idle"
   | "planning"
+  | "awaiting-approval"
   | "building"
   | "reviewing"
   | "complete"
@@ -75,17 +80,26 @@ export interface BuildState {
 export type BuildEvent =
   | { type: "planning" }
   | { type: "plan-ready"; plan: BuildPlan }
+  | { type: "plan-approved" }
   | { type: "conversation-response"; content: string }
+  | { type: "quick-change-start"; description: string; files: PlannedFile[] }
   | { type: "phase-start"; phaseIndex: number }
   | { type: "file-generating"; phaseIndex: number; fileIndex: number }
+  | { type: "file-updating"; phaseIndex: number; fileIndex: number }
   | { type: "file-created"; phaseIndex: number; fileIndex: number; path: string }
   | { type: "file-updated"; phaseIndex: number; fileIndex: number; path: string }
   | { type: "file-error"; phaseIndex: number; fileIndex: number; error: string }
+  | { type: "file-reading"; phaseIndex: number; fileIndex: number }
+  | { type: "file-read"; phaseIndex: number; fileIndex: number; path: string }
+  | { type: "file-deleting"; phaseIndex: number; fileIndex: number }
+  | { type: "file-deleted"; phaseIndex: number; fileIndex: number; path: string }
+  | { type: "dynamic-file"; phaseIndex: number; file: FileState }
   | { type: "phase-reviewing"; phaseIndex: number }
   | { type: "phase-complete"; phaseIndex: number }
   | { type: "build-complete"; summary: string }
   | { type: "build-error"; error: string }
-  | { type: "thinking"; message: string };
+  | { type: "thinking"; message: string }
+  | { type: "snapshot"; state: any };
 
 export const INITIAL_BUILD_STATE: BuildState = {
   status: "idle",
@@ -107,7 +121,7 @@ export function buildReducer(state: BuildState, event: BuildEvent): BuildState {
     case "plan-ready":
       return {
         ...state,
-        status: "building",
+        status: "awaiting-approval",
         plan: event.plan,
         thinkingMessage: null,
         phases: event.plan.phases.map((p) => ({
@@ -123,8 +137,35 @@ export function buildReducer(state: BuildState, event: BuildEvent): BuildState {
         })),
       };
 
+    case "plan-approved":
+      return { ...state, status: "building" };
+
     case "conversation-response":
       return { ...INITIAL_BUILD_STATE };
+
+    case "quick-change-start":
+      return {
+        ...state,
+        status: "building",
+        plan: {
+          pluginName: "Quick Change",
+          packageName: "",
+          description: event.description,
+          phases: [{ name: "Quick Change", description: event.description, files: event.files }],
+        },
+        phases: [{
+          name: "Quick Change",
+          description: event.description,
+          status: "active",
+          files: event.files.map((f) => ({
+            path: f.path,
+            name: f.name,
+            description: f.description,
+            status: "pending" as const,
+          })),
+        }],
+        thinkingMessage: "Applying changes...",
+      };
 
     case "phase-start": {
       const phases = [...state.phases];
@@ -139,6 +180,15 @@ export function buildReducer(state: BuildState, event: BuildEvent): BuildState {
       phases[event.phaseIndex] = { ...phases[event.phaseIndex], files };
       const fileName = files[event.fileIndex].name;
       return { ...state, phases, thinkingMessage: `Generating ${fileName}...` };
+    }
+
+    case "file-updating": {
+      const phases = [...state.phases];
+      const files = [...phases[event.phaseIndex].files];
+      files[event.fileIndex] = { ...files[event.fileIndex], status: "updating" };
+      phases[event.phaseIndex] = { ...phases[event.phaseIndex], files };
+      const fileName = files[event.fileIndex].name;
+      return { ...state, phases, thinkingMessage: `Updating ${fileName}...` };
     }
 
     case "file-created": {
@@ -165,6 +215,47 @@ export function buildReducer(state: BuildState, event: BuildEvent): BuildState {
       return { ...state, phases, thinkingMessage: null };
     }
 
+    case "file-reading": {
+      const phases = [...state.phases];
+      const files = [...phases[event.phaseIndex].files];
+      files[event.fileIndex] = { ...files[event.fileIndex], status: "reading" };
+      phases[event.phaseIndex] = { ...phases[event.phaseIndex], files };
+      const fileName = files[event.fileIndex].name;
+      return { ...state, phases, thinkingMessage: `Reading ${fileName}...` };
+    }
+
+    case "file-read": {
+      const phases = [...state.phases];
+      const files = [...phases[event.phaseIndex].files];
+      files[event.fileIndex] = { ...files[event.fileIndex], status: "read" };
+      phases[event.phaseIndex] = { ...phases[event.phaseIndex], files };
+      return { ...state, phases, thinkingMessage: null };
+    }
+
+    case "file-deleting": {
+      const phases = [...state.phases];
+      const files = [...phases[event.phaseIndex].files];
+      files[event.fileIndex] = { ...files[event.fileIndex], status: "deleting" };
+      phases[event.phaseIndex] = { ...phases[event.phaseIndex], files };
+      const fileName = files[event.fileIndex].name;
+      return { ...state, phases, thinkingMessage: `Deleting ${fileName}...` };
+    }
+
+    case "file-deleted": {
+      const phases = [...state.phases];
+      const files = [...phases[event.phaseIndex].files];
+      files[event.fileIndex] = { ...files[event.fileIndex], status: "deleted" };
+      phases[event.phaseIndex] = { ...phases[event.phaseIndex], files };
+      return { ...state, phases, thinkingMessage: null };
+    }
+
+    case "dynamic-file": {
+      const phases = [...state.phases];
+      const files = [...phases[event.phaseIndex].files, event.file];
+      phases[event.phaseIndex] = { ...phases[event.phaseIndex], files };
+      return { ...state, phases };
+    }
+
     case "phase-reviewing": {
       const phases = [...state.phases];
       phases[event.phaseIndex] = { ...phases[event.phaseIndex], status: "reviewing" };
@@ -186,6 +277,18 @@ export function buildReducer(state: BuildState, event: BuildEvent): BuildState {
     case "thinking":
       return { ...state, thinkingMessage: event.message };
 
+    case "snapshot": {
+      const s = event.state;
+      return {
+        status: s.status || "idle",
+        plan: s.plan || null,
+        phases: s.phases || [],
+        thinkingMessage: s.thinkingMessage || null,
+        summary: s.summary || null,
+        error: s.error || null,
+      };
+    }
+
     default:
       return state;
   }
@@ -200,11 +303,16 @@ interface RunBuildParams {
   framework: string;
   onEvent: (event: BuildEvent) => void;
   signal: AbortSignal;
+  /** Called after plan is ready. Build pauses until resolved. Return action: approve, edit (with instructions), or cancel. */
+  onPlanConfirm?: (plan: BuildPlan) => Promise<{ action: 'approve' | 'edit' | 'cancel'; editInstructions?: string }>;
+  /** Called when a file fails after all retries. Return 'retry' to retry or 'cancel' to stop the build. */
+  onFileError?: (filePath: string, error: string) => Promise<'retry' | 'cancel'>;
+  /** Context from a previous interrupted build, injected into planning */
+  resumeContext?: string;
 }
 
-const MAX_RETRIES = 3;
-const RETRY_DELAYS = [1000, 3000, 7000];
-const MAX_CONTEXT_SIZE = 50_000; // 50KB of file context per AI call
+const MAX_RETRIES = 2;
+const RETRY_DELAYS = [500, 2000];
 const MAX_CONTINUATIONS = 3;
 
 /**
@@ -218,7 +326,9 @@ export async function runBuild(params: RunBuildParams): Promise<void> {
   // Map of filePath → DB file ID for updates
   const fileIdMap = new Map<string, number>();
 
-  // Helper: call AI with retry and auto-continuation
+  // Helper: call AI with retry, timeout, and auto-continuation
+  const AI_TIMEOUT_MS = 120_000; // 2 minutes per attempt
+
   async function callAI(
     systemPrompt: string,
     userContent: string,
@@ -229,6 +339,12 @@ export async function runBuild(params: RunBuildParams): Promise<void> {
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       if (signal.aborted) throw new Error("Build cancelled");
 
+      // Combine user abort signal with per-attempt timeout
+      const timeoutController = new AbortController();
+      const timeoutId = setTimeout(() => timeoutController.abort(), AI_TIMEOUT_MS);
+      const onParentAbort = () => timeoutController.abort();
+      signal.addEventListener("abort", onParentAbort, { once: true });
+
       try {
         const result = await generateAI({
           model,
@@ -236,14 +352,14 @@ export async function runBuild(params: RunBuildParams): Promise<void> {
           messages: [{ role: "user", content: userContent }],
           sessionId,
           maxTokens,
-          signal,
+          signal: timeoutController.signal,
         });
 
         // Auto-continuation: if response was truncated
         let fullText = result.text;
         if (result.finishReason === "length" && fullText.length > 0) {
           for (let cont = 0; cont < MAX_CONTINUATIONS; cont++) {
-            if (signal.aborted) break;
+            if (signal.aborted || timeoutController.signal.aborted) break;
             const contPrompt = buildContinuationPrompt("file", fullText.slice(-2000));
             const contResult = await generateAI({
               model,
@@ -251,7 +367,7 @@ export async function runBuild(params: RunBuildParams): Promise<void> {
               messages: [{ role: "user", content: "Continue." }],
               sessionId,
               maxTokens,
-              signal,
+              signal: timeoutController.signal,
             });
             fullText += contResult.text;
             if (contResult.finishReason !== "length") break;
@@ -262,9 +378,16 @@ export async function runBuild(params: RunBuildParams): Promise<void> {
       } catch (e: any) {
         lastError = e;
         if (e.message === "Build cancelled" || signal.aborted) throw e;
+        // Convert timeout aborts to a clearer error
+        if (e.name === "AbortError" && !signal.aborted) {
+          lastError = new Error("AI request timed out after 2 minutes");
+        }
         if (attempt < MAX_RETRIES) {
           await sleep(RETRY_DELAYS[attempt]);
         }
+      } finally {
+        clearTimeout(timeoutId);
+        signal.removeEventListener("abort", onParentAbort);
       }
     }
 
@@ -316,31 +439,64 @@ export async function runBuild(params: RunBuildParams): Promise<void> {
   }
 
   // Helper: build project context string from file memory
-  function buildProjectContext(): string {
+  // Includes ALL file contents — full context is critical for AI accuracy
+  function buildProjectContext(currentPhasePaths?: string[]): string {
     if (fileMemory.size === 0) return "No files created yet.";
 
     let context = "Files created so far:\n";
-    let totalSize = 0;
 
     const entries = Array.from(fileMemory.entries());
-    for (const [path, content] of entries) {
-      const entry = `\n--- ${path} ---\n${content}\n`;
-      if (totalSize + entry.length > MAX_CONTEXT_SIZE) {
-        // Truncate large files, keep listing all paths
-        const remaining = MAX_CONTEXT_SIZE - totalSize;
-        if (remaining > 100) {
-          context += `\n--- ${path} ---\n${content.slice(0, remaining - 50)}\n[... truncated ...]\n`;
-        } else {
-          context += `\n- ${path} (content omitted for brevity)`;
-        }
-        totalSize = MAX_CONTEXT_SIZE;
-      } else {
-        context += entry;
-        totalSize += entry.length;
-      }
+    const prioritySet = new Set(currentPhasePaths || []);
+
+    // Sort: priority files first (current phase), then others
+    const sorted = entries.sort(([a], [b]) => {
+      const ap = prioritySet.has(a) ? 0 : 1;
+      const bp = prioritySet.has(b) ? 0 : 1;
+      return ap - bp;
+    });
+
+    for (const [path, content] of sorted) {
+      context += `\n--- ${path} ---\n${content}\n`;
     }
 
     return context;
+  }
+
+  // Helper: sanitize error messages for display
+  function sanitizeError(msg: string): string {
+    if (!msg) return "An unknown error occurred";
+    let clean = msg.replace(/<[^>]*>/g, "");
+    if (clean.length > 300) clean = clean.slice(0, 297) + "...";
+    return clean;
+  }
+
+  // Helper: parse JSON from AI response (strips markdown fences, regex fallback)
+  function parseAIPlanJSON(text: string): any {
+    let cleaned = text.trim();
+    // Strip markdown code fences (```json ... ``` or ``` ... ```)
+    cleaned = cleaned.replace(/^```(?:json)?\s*\n?/m, "").replace(/\n?```\s*$/m, "");
+    try {
+      return JSON.parse(cleaned);
+    } catch {
+      // Try extracting the outermost JSON object
+      const match = cleaned.match(/\{[\s\S]*\}/);
+      if (match) {
+        try {
+          return JSON.parse(match[0]);
+        } catch {
+          // JSON is malformed — try to fix common AI issues (trailing commas)
+          try {
+            const fixed = match[0]
+              .replace(/,\s*([}\]])/g, "$1")  // remove trailing commas
+              .replace(/'/g, '"');              // single quotes to double quotes
+            return JSON.parse(fixed);
+          } catch {
+            // All parse attempts failed
+          }
+        }
+      }
+      throw new Error("Failed to parse build plan from AI response. Please try again.");
+    }
   }
 
   // ─── Pipeline starts here ─────────────────────────────────────────────
@@ -353,32 +509,28 @@ export async function runBuild(params: RunBuildParams): Promise<void> {
       modelId: model.id,
     });
 
-    // 2. Planning
+    // 2. Planning — fetch existing files first so the AI has full project context
     onEvent({ type: "planning" });
-    const planningPrompt = buildPlanningPrompt(userRequest, framework);
-    const planRaw = await callAI(planningPrompt, userRequest);
+    let existingFilesForPlanning: { path: string; content: string }[] = [];
+    try {
+      const efRes = await apiRequest("GET", `/api/sessions/${sessionId}/files`);
+      const efList: { id: number; path: string; content: string }[] = await efRes.json();
+      for (const ef of efList) {
+        if (ef.content) {
+          existingFilesForPlanning.push({ path: ef.path, content: ef.content });
+        }
+        fileMemory.set(ef.path, ef.content);
+        fileIdMap.set(ef.path, ef.id);
+      }
+    } catch {}
+    const planningPrompt = buildPlanningPrompt(userRequest, framework, existingFilesForPlanning.length > 0 ? existingFilesForPlanning : undefined);
+    const planningInput = params.resumeContext
+      ? `${userRequest}\n\nCONTEXT FROM PREVIOUS BUILD:\n${params.resumeContext}`
+      : userRequest;
+    const planRaw = await callAI(planningPrompt, planningInput);
 
     // Parse the JSON plan (strip markdown fences if AI wrapped them)
-    let planJson: any;
-    try {
-      const cleaned = planRaw
-        .replace(/^```(?:json)?\s*\n?/m, "")
-        .replace(/\n?```\s*$/m, "")
-        .trim();
-      planJson = JSON.parse(cleaned);
-    } catch {
-      // If JSON parse fails, try extracting JSON from the response
-      const jsonMatch = planRaw.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        try {
-          planJson = JSON.parse(jsonMatch[0]);
-        } catch {
-          throw new Error("Failed to parse build plan from AI response");
-        }
-      } else {
-        throw new Error("AI did not return a valid build plan");
-      }
-    }
+    const planJson = parseAIPlanJSON(planRaw);
 
     // Handle conversation response (non-build request)
     if (planJson.type === "conversation") {
@@ -391,8 +543,148 @@ export async function runBuild(params: RunBuildParams): Promise<void> {
       return;
     }
 
+    // Handle quick-change — agentic loop: AI dynamically decides what to read/update/create/delete
+    if (planJson.type === "quick-change") {
+      // Start with an empty phase — files are added dynamically
+      onEvent({ type: "quick-change-start", description: planJson.description || "Applying changes", files: [] });
+
+      const phaseIndex = 0;
+      const fileSummaries: { path: string; summary: string }[] = [];
+      const actionsLog: { action: string; path: string; reason: string }[] = [];
+      const fileTree = Array.from(fileMemory.keys());
+      let dynamicFileIndex = 0;
+      const MAX_AGENTIC_STEPS = 20;
+
+      for (let step = 0; step < MAX_AGENTIC_STEPS; step++) {
+        if (signal.aborted) throw new Error("Build cancelled");
+
+        onEvent({ type: "thinking", message: "Deciding next action..." });
+        const stepPrompt = buildAgenticStepPrompt(userRequest, fileTree, fileSummaries, actionsLog);
+        const stepRaw = await callAI(stepPrompt, "Decide the next action.");
+        let stepJson: any;
+        try {
+          stepJson = parseAIPlanJSON(stepRaw);
+        } catch {
+          break; // Can't parse — treat as done
+        }
+
+        const action = stepJson.action;
+        const actionPath = stepJson.path || "";
+        const actionReason = stepJson.reason || "";
+
+        if (action === "done") {
+          // Build complete
+          const changeList = actionsLog
+            .filter((a) => a.action !== "read")
+            .map((a) => `- \`${a.path}\`: ${a.reason}`)
+            .join("\n");
+          const summaryContent = `**Quick Change Applied**\n\n${stepJson.summary || planJson.description || "Changes applied"}\n\n${changeList}`;
+          await apiRequest("POST", `/api/sessions/${sessionId}/messages`, {
+            role: "assistant",
+            content: summaryContent,
+            modelId: model.id,
+          });
+          onEvent({ type: "build-complete", summary: summaryContent });
+          return;
+        }
+
+        // Add a dynamic badge for this action
+        const fileName = actionPath.split("/").pop() || actionPath;
+        const badgeStatus: FileState["status"] =
+          action === "read" ? "reading" :
+          action === "update" ? "updating" :
+          action === "create" ? "generating" :
+          action === "delete" ? "deleting" : "pending";
+        const fileIdx = dynamicFileIndex++;
+        onEvent({
+          type: "dynamic-file",
+          phaseIndex,
+          file: { path: actionPath, name: fileName, description: actionReason, status: badgeStatus },
+        });
+
+        if (action === "read") {
+          onEvent({ type: "file-reading", phaseIndex, fileIndex: fileIdx });
+          const content = fileMemory.get(actionPath);
+          if (content) {
+            // Analyze with AI for summary
+            const readPrompt = buildFileReadPrompt(actionPath, content, userRequest, framework);
+            const analysisRaw = await callAI(readPrompt, `Analyze ${actionPath}`);
+            let summaryText: string;
+            try {
+              const analysis = JSON.parse(analysisRaw.replace(/^```(?:json)?\s*\n?/m, "").replace(/\n?```\s*$/m, "").trim());
+              summaryText = `${analysis.purpose || ""}. Exports: ${(analysis.exports || []).join(", ")}`;
+            } catch {
+              summaryText = analysisRaw.slice(0, 200);
+            }
+            fileSummaries.push({ path: actionPath, summary: summaryText });
+          }
+          onEvent({ type: "file-read", phaseIndex, fileIndex: fileIdx, path: actionPath });
+        } else if (action === "update") {
+          onEvent({ type: "file-updating", phaseIndex, fileIndex: fileIdx });
+          const existingContent = fileMemory.get(actionPath);
+          const existingId = fileIdMap.get(actionPath);
+          if (existingContent && existingId) {
+            const patchPrompt = buildPatchPrompt(
+              actionPath, existingContent,
+              `${userRequest} — specifically: ${actionReason}`,
+              framework, "com.example.plugin",
+            );
+            const updatedContent = await callAI(patchPrompt, `Apply this change: ${actionReason}`);
+            await apiRequest("PATCH", `/api/files/${existingId}`, { content: updatedContent });
+            fileMemory.set(actionPath, updatedContent);
+            onEvent({ type: "file-updated", phaseIndex, fileIndex: fileIdx, path: actionPath });
+          } else {
+            onEvent({ type: "file-error", phaseIndex, fileIndex: fileIdx, error: "File not found for update" });
+          }
+        } else if (action === "create") {
+          onEvent({ type: "file-generating", phaseIndex, fileIndex: fileIdx });
+          const projectContext = buildProjectContext();
+          const genPrompt = buildFileGenerationPrompt(
+            actionPath, fileName, actionReason,
+            "Quick Change", projectContext, framework, "com.example.plugin",
+          );
+          const content = await callAI(genPrompt, `Generate ${actionPath}`);
+          const createRes = await apiRequest("POST", `/api/sessions/${sessionId}/files`, {
+            path: actionPath, name: fileName, content,
+          });
+          const created = await createRes.json();
+          fileMemory.set(actionPath, content);
+          fileIdMap.set(actionPath, created.id);
+          fileTree.push(actionPath);
+          onEvent({ type: "file-created", phaseIndex, fileIndex: fileIdx, path: actionPath });
+        } else if (action === "delete") {
+          onEvent({ type: "file-deleting", phaseIndex, fileIndex: fileIdx });
+          const existingId = fileIdMap.get(actionPath);
+          if (existingId) {
+            await apiRequest("DELETE", `/api/files/${existingId}`);
+            fileMemory.delete(actionPath);
+            fileIdMap.delete(actionPath);
+            const treeIdx = fileTree.indexOf(actionPath);
+            if (treeIdx !== -1) fileTree.splice(treeIdx, 1);
+          }
+          onEvent({ type: "file-deleted", phaseIndex, fileIndex: fileIdx, path: actionPath });
+        }
+
+        actionsLog.push({ action, path: actionPath, reason: actionReason });
+      }
+
+      // If we hit the step limit, wrap up
+      const changeList = actionsLog
+        .filter((a) => a.action !== "read")
+        .map((a) => `- \`${a.path}\`: ${a.reason}`)
+        .join("\n");
+      const summaryContent = `**Quick Change Applied**\n\n${planJson.description || "Changes applied"}\n\n${changeList}`;
+      await apiRequest("POST", `/api/sessions/${sessionId}/messages`, {
+        role: "assistant",
+        content: summaryContent,
+        modelId: model.id,
+      });
+      onEvent({ type: "build-complete", summary: summaryContent });
+      return;
+    }
+
     // Validate plan structure
-    const plan: BuildPlan = {
+    let plan: BuildPlan = {
       pluginName: planJson.pluginName || "Plugin",
       packageName: planJson.packageName || "com.example.plugin",
       description: planJson.description || "",
@@ -427,49 +719,183 @@ export async function runBuild(params: RunBuildParams): Promise<void> {
 
     onEvent({ type: "plan-ready", plan });
 
+    // Persist plan to server so it survives page close
+    try {
+      await apiRequest("PATCH", `/api/sessions/${sessionId}`, {
+        buildPlan: plan,
+        buildStatus: "awaiting-approval",
+      });
+    } catch {
+      // Non-fatal: plan is still in localStorage
+    }
+
+    // Wait for plan confirmation if handler is provided (supports edit loop)
+    if (params.onPlanConfirm) {
+      let currentPlan = plan;
+      while (true) {
+        const result = await params.onPlanConfirm(currentPlan);
+        if (result.action === 'approve') break;
+        if (result.action === 'cancel') {
+          onEvent({ type: "build-error", error: "Plan was cancelled by user." });
+          return;
+        }
+        if (result.action === 'edit' && result.editInstructions) {
+          onEvent({ type: "thinking", message: "Revising plan..." });
+          const revisedPlanText = await callAI(
+            buildPlanningPrompt(
+              `${userRequest}\n\nIMPORTANT MODIFICATIONS: ${result.editInstructions}`,
+              framework,
+              existingFilesForPlanning.length > 0 ? existingFilesForPlanning : undefined,
+            ),
+            "Revise the build plan with these modifications.",
+          );
+          const revisedParsed = parseAIPlanJSON(revisedPlanText);
+          if (revisedParsed?.type === "build" || revisedParsed?.phases) {
+            currentPlan = {
+              pluginName: revisedParsed.pluginName || currentPlan.pluginName,
+              packageName: revisedParsed.packageName || currentPlan.packageName,
+              description: revisedParsed.description || currentPlan.description,
+              phases: (revisedParsed.phases || []).map((p: any) => ({
+                name: p.name || "Phase",
+                description: p.description || "",
+                files: (p.files || []).map((f: any) => ({
+                  path: f.path || f.name || "unknown",
+                  name: f.name || f.path?.split("/").pop() || "unknown",
+                  description: f.description || "",
+                })),
+              })),
+            };
+            plan = currentPlan;
+            onEvent({ type: "plan-ready", plan: currentPlan });
+          }
+        }
+      }
+    }
+
+    onEvent({ type: "plan-approved" });
+
+    // Update server build status
+    try {
+      await apiRequest("PATCH", `/api/sessions/${sessionId}`, { buildStatus: "building" });
+    } catch {}
+
     // 3. Phase loop
+    // Track dynamic file indices per phase for file-reading badges
+    const phaseDynamicIndices = new Map<number, number>();
+
     for (let phaseIdx = 0; phaseIdx < plan.phases.length; phaseIdx++) {
       if (signal.aborted) throw new Error("Build cancelled");
 
       const phase = plan.phases[phaseIdx];
       onEvent({ type: "phase-start", phaseIndex: phaseIdx });
 
-      // 3a. File creation loop — one file per AI call
-      for (let fileIdx = 0; fileIdx < phase.files.length; fileIdx++) {
+      // 3a-pre. File reading — ask AI which existing files to read for context
+      let dynamicIdx = phase.files.length; // Dynamic badges start after planned files
+      phaseDynamicIndices.set(phaseIdx, dynamicIdx);
+
+      if (fileMemory.size > 0) {
+        try {
+          onEvent({ type: "thinking", message: "Analyzing dependencies..." });
+          const existingPaths = Array.from(fileMemory.keys());
+          const phaseFileNames = phase.files.map((f) => `- ${f.path}: ${f.description}`).join("\n");
+          const readCheckPrompt = `You are AuroraCraft. For this build phase, determine which existing project files need to be read for context.
+
+Phase: ${phase.name} — ${phase.description}
+Files to generate in this phase:
+${phaseFileNames}
+
+Existing project files: ${existingPaths.map((p) => `\n- ${p}`).join("")}
+
+Return ONLY a JSON array of file paths that should be read for context. Example: ["pom.xml", "src/main/java/..."]
+If no files need to be read, return an empty array: []
+No text before or after the JSON.`;
+
+          const readListRaw = await callAI(readCheckPrompt, "Which files should I read?");
+          let filesToRead: string[] = [];
+          try {
+            const cleaned = readListRaw.replace(/^```(?:json)?\s*\n?/m, "").replace(/\n?```\s*$/m, "").trim();
+            filesToRead = JSON.parse(cleaned);
+            if (!Array.isArray(filesToRead)) filesToRead = [];
+          } catch {
+            filesToRead = [];
+          }
+
+          for (const readPath of filesToRead) {
+            if (signal.aborted) throw new Error("Build cancelled");
+            const content = fileMemory.get(readPath);
+            if (!content) continue;
+
+            const readFileName = readPath.split("/").pop() || readPath;
+            const readIdx = dynamicIdx++;
+            onEvent({
+              type: "dynamic-file",
+              phaseIndex: phaseIdx,
+              file: { path: readPath, name: readFileName, description: "Reading for context", status: "reading" },
+            });
+            onEvent({ type: "file-reading", phaseIndex: phaseIdx, fileIndex: readIdx });
+
+            // AI analysis for context enrichment
+            const readPrompt = buildFileReadPrompt(readPath, content, userRequest, framework);
+            await callAI(readPrompt, `Analyze ${readPath}`);
+
+            onEvent({ type: "file-read", phaseIndex: phaseIdx, fileIndex: readIdx, path: readPath });
+          }
+        } catch (e: any) {
+          if (e.message === "Build cancelled") throw e;
+          // File reading is non-fatal
+        }
+      }
+
+      phaseDynamicIndices.set(phaseIdx, dynamicIdx);
+
+      // 3a. File creation loop — one file per AI call (while loop to support retry)
+      let fileIdx = 0;
+      while (fileIdx < phase.files.length) {
         if (signal.aborted) throw new Error("Build cancelled");
 
         const file = phase.files[fileIdx];
         onEvent({ type: "file-generating", phaseIndex: phaseIdx, fileIndex: fileIdx });
 
         try {
+          const currentPhasePaths = phase.files.slice(0, fileIdx).map(f => f.path);
           const filePrompt = buildFileGenerationPrompt(
             file.path,
             file.name,
             file.description,
             phase.name,
-            buildProjectContext(),
+            buildProjectContext(currentPhasePaths),
             framework,
             plan.packageName,
           );
 
           const fileContent = await callAI(filePrompt, `Generate ${file.path}`);
           await writeFile(file.path, file.name, fileContent);
-          await reportTokenUsage(filePrompt.length, fileContent.length);
+          reportTokenUsage(filePrompt.length, fileContent.length);
 
           onEvent({ type: "file-created", phaseIndex: phaseIdx, fileIndex: fileIdx, path: file.path });
+          fileIdx++;
         } catch (e: any) {
           if (e.message === "Build cancelled") throw e;
+
+          const errorMsg = sanitizeError(e.message || "Unknown error");
           onEvent({
             type: "file-error",
             phaseIndex: phaseIdx,
             fileIndex: fileIdx,
-            error: e.message || "Unknown error",
+            error: errorMsg,
           });
-          // Continue to next file — don't stop the whole build
+
+          // Ask user what to do if handler is provided
+          if (params.onFileError) {
+            const decision = await params.onFileError(file.path, errorMsg);
+            if (decision === 'cancel') throw new Error("Build cancelled");
+            if (decision === 'retry') continue; // retry same fileIdx
+          }
+          fileIdx++; // skip this file if no handler or unrecognized decision
         }
       }
 
-      // 3b. Phase review
+      // 3b. Phase review — with cross-phase awareness
       if (signal.aborted) throw new Error("Build cancelled");
       onEvent({ type: "phase-reviewing", phaseIndex: phaseIdx });
 
@@ -478,8 +904,11 @@ export async function runBuild(params: RunBuildParams): Promise<void> {
           .filter((f) => fileMemory.has(f.path))
           .map((f) => ({ path: f.path, content: fileMemory.get(f.path)! }));
 
+        // Collect ALL project files for cross-phase awareness
+        const allProjectFiles = Array.from(fileMemory.entries()).map(([path, content]) => ({ path, content }));
+
         if (phaseFiles.length > 0) {
-          const reviewPrompt = buildReviewPrompt(phaseFiles, framework);
+          const reviewPrompt = buildReviewPrompt(phaseFiles, framework, allProjectFiles);
           const reviewRaw = await callAI(reviewPrompt, "Review these files.");
 
           let reviewResult: any;
@@ -502,39 +931,66 @@ export async function runBuild(params: RunBuildParams): Promise<void> {
             }
           }
 
-          // 3c. Fix loop — if review found issues
+          // 3c. Fix loop — supports cross-phase fixes
           if (!reviewResult.passed && Array.isArray(reviewResult.fixes)) {
             for (const fix of reviewResult.fixes) {
               if (signal.aborted) throw new Error("Build cancelled");
 
-              const fileIdx = phase.files.findIndex((f) => f.path === fix.path);
-              if (fileIdx === -1) continue;
+              // Search across ALL phases for the file, not just current phase
+              let fixPhaseIdx = phaseIdx;
+              let fixFileIdx = phase.files.findIndex((f) => f.path === fix.path);
 
-              const file = phase.files[fileIdx];
-              onEvent({ type: "file-generating", phaseIndex: phaseIdx, fileIndex: fileIdx });
+              if (fixFileIdx === -1) {
+                // Search previous phases
+                for (let pi = 0; pi < plan.phases.length; pi++) {
+                  const fi = plan.phases[pi].files.findIndex((f) => f.path === fix.path);
+                  if (fi !== -1) {
+                    fixPhaseIdx = pi;
+                    fixFileIdx = fi;
+                    break;
+                  }
+                }
+              }
+
+              if (fixFileIdx === -1) continue;
+
+              const fixFile = plan.phases[fixPhaseIdx].files[fixFileIdx];
+              onEvent({ type: "file-updating", phaseIndex: fixPhaseIdx, fileIndex: fixFileIdx });
 
               try {
-                const fixPrompt = buildFileGenerationPrompt(
-                  file.path,
-                  file.name,
-                  `${file.description}. FIX REQUIRED: ${fix.reason}`,
-                  phase.name,
-                  buildProjectContext(),
-                  framework,
-                  plan.packageName,
-                );
+                const existingContent = fileMemory.get(fixFile.path);
+                let fixPrompt: string;
+                if (existingContent) {
+                  fixPrompt = buildPatchPrompt(
+                    fixFile.path,
+                    existingContent,
+                    fix.reason,
+                    framework,
+                    plan.packageName,
+                  );
+                } else {
+                  fixPrompt = buildFileGenerationPrompt(
+                    fixFile.path,
+                    fixFile.name,
+                    `${fixFile.description}. FIX REQUIRED: ${fix.reason}`,
+                    phase.name,
+                    buildProjectContext(),
+                    framework,
+                    plan.packageName,
+                  );
+                }
 
-                const fixedContent = await callAI(fixPrompt, `Fix and regenerate ${file.path}: ${fix.reason}`);
-                await writeFile(file.path, file.name, fixedContent);
-                await reportTokenUsage(fixPrompt.length, fixedContent.length);
+                const fixedContent = await callAI(fixPrompt, `Fix ${fixFile.path}: ${fix.reason}`);
+                await writeFile(fixFile.path, fixFile.name, fixedContent);
+                reportTokenUsage(fixPrompt.length, fixedContent.length);
 
-                onEvent({ type: "file-updated", phaseIndex: phaseIdx, fileIndex: fileIdx, path: file.path });
+                onEvent({ type: "file-updated", phaseIndex: fixPhaseIdx, fileIndex: fixFileIdx, path: fixFile.path });
               } catch (e: any) {
                 if (e.message === "Build cancelled") throw e;
                 onEvent({
                   type: "file-error",
-                  phaseIndex: phaseIdx,
-                  fileIndex: fileIdx,
+                  phaseIndex: fixPhaseIdx,
+                  fileIndex: fixFileIdx,
                   error: e.message || "Fix failed",
                 });
               }
@@ -571,12 +1027,336 @@ export async function runBuild(params: RunBuildParams): Promise<void> {
     });
 
     onEvent({ type: "build-complete", summary });
+
+    // Update server build status
+    try {
+      await apiRequest("PATCH", `/api/sessions/${sessionId}`, { buildStatus: "complete" });
+    } catch {}
   } catch (e: any) {
     if (e.message === "Build cancelled" || signal.aborted) {
       onEvent({ type: "build-error", error: "Build was cancelled" });
     } else {
-      onEvent({ type: "build-error", error: e.message || "Build failed unexpectedly" });
+      onEvent({ type: "build-error", error: sanitizeError(e.message || "Build failed unexpectedly") });
     }
+    // Update server build status on error
+    try {
+      await apiRequest("PATCH", `/api/sessions/${sessionId}`, { buildStatus: "error" });
+    } catch {}
+  }
+}
+
+// ─── Resume Build ─────────────────────────────────────────────────────────
+
+interface ResumeBuildParams {
+  plan: BuildPlan;
+  phases: PhaseState[];
+  sessionId: number;
+  model: { id: number; name: string; providerAuthType?: string | null };
+  framework: string;
+  onEvent: (event: BuildEvent) => void;
+  signal: AbortSignal;
+  onFileError?: (filePath: string, error: string) => Promise<'retry' | 'cancel'>;
+}
+
+/**
+ * Resumes a build from where it left off — skips planning and completed files.
+ */
+export async function resumeBuild(params: ResumeBuildParams): Promise<void> {
+  const { plan, phases, sessionId, model, framework, onEvent, signal } = params;
+
+  const fileMemory = new Map<string, string>();
+  const fileIdMap = new Map<string, number>();
+
+  const AI_TIMEOUT_MS = 120_000;
+
+  async function callAI(
+    systemPrompt: string,
+    userContent: string,
+    maxTokens?: number,
+  ): Promise<string> {
+    let lastError: Error | null = null;
+
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      if (signal.aborted) throw new Error("Build cancelled");
+
+      const timeoutController = new AbortController();
+      const timeoutId = setTimeout(() => timeoutController.abort(), AI_TIMEOUT_MS);
+      const onParentAbort = () => timeoutController.abort();
+      signal.addEventListener("abort", onParentAbort, { once: true });
+
+      try {
+        const result = await generateAI({
+          model,
+          systemPrompt,
+          messages: [{ role: "user", content: userContent }],
+          sessionId,
+          maxTokens,
+          signal: timeoutController.signal,
+        });
+
+        let fullText = result.text;
+        if (result.finishReason === "length" && fullText.length > 0) {
+          for (let cont = 0; cont < MAX_CONTINUATIONS; cont++) {
+            if (signal.aborted || timeoutController.signal.aborted) break;
+            const contPrompt = buildContinuationPrompt("file", fullText.slice(-2000));
+            const contResult = await generateAI({
+              model,
+              systemPrompt: contPrompt,
+              messages: [{ role: "user", content: "Continue." }],
+              sessionId,
+              maxTokens,
+              signal: timeoutController.signal,
+            });
+            fullText += contResult.text;
+            if (contResult.finishReason !== "length") break;
+          }
+        }
+
+        return fullText;
+      } catch (e: any) {
+        lastError = e;
+        if (e.message === "Build cancelled" || signal.aborted) throw e;
+        if (e.name === "AbortError" && !signal.aborted) {
+          lastError = new Error("AI request timed out after 2 minutes");
+        }
+        if (attempt < MAX_RETRIES) {
+          await sleep(RETRY_DELAYS[attempt]);
+        }
+      } finally {
+        clearTimeout(timeoutId);
+        signal.removeEventListener("abort", onParentAbort);
+      }
+    }
+
+    throw lastError || new Error("AI call failed after retries");
+  }
+
+  async function writeFile(filePath: string, fileName: string, content: string): Promise<number> {
+    const existingId = fileIdMap.get(filePath);
+    if (existingId) {
+      const response = await apiRequest("PATCH", `/api/files/${existingId}`, { content, name: fileName, path: filePath });
+      const file = await response.json();
+      fileMemory.set(filePath, content);
+      return file.id;
+    }
+    const response = await apiRequest("POST", `/api/sessions/${sessionId}/files`, {
+      name: fileName, path: filePath, content, isFolder: false,
+    });
+    const file = await response.json();
+    fileMemory.set(filePath, content);
+    fileIdMap.set(filePath, file.id);
+    return file.id;
+  }
+
+  async function reportTokenUsage(inputChars: number, outputChars: number): Promise<void> {
+    try {
+      await apiRequest("POST", "/api/token-usage/apply", {
+        sessionId, modelId: model.id, inputChars, outputChars, action: "chat",
+      });
+    } catch {}
+  }
+
+  function buildProjectContext(currentPhasePaths?: string[]): string {
+    if (fileMemory.size === 0) return "No files created yet.";
+    let context = "Files created so far:\n";
+    const entries = Array.from(fileMemory.entries());
+    const prioritySet = new Set(currentPhasePaths || []);
+    const sorted = entries.sort(([a], [b]) => {
+      const ap = prioritySet.has(a) ? 0 : 1;
+      const bp = prioritySet.has(b) ? 0 : 1;
+      return ap - bp;
+    });
+    for (const [path, content] of sorted) {
+      context += `\n--- ${path} ---\n${content}\n`;
+    }
+    return context;
+  }
+
+  function sanitizeError(msg: string): string {
+    if (!msg) return "An unknown error occurred";
+    let clean = msg.replace(/<[^>]*>/g, "");
+    if (clean.length > 300) clean = clean.slice(0, 297) + "...";
+    return clean;
+  }
+
+  // ── Pre-load existing file contents from the server into fileMemory ──
+  try {
+    const filesRes = await apiRequest("GET", `/api/sessions/${sessionId}/files`);
+    const existingFiles: any[] = await filesRes.json();
+    for (const f of existingFiles) {
+      if (!f.isFolder && f.content) {
+        fileMemory.set(f.path, f.content);
+        fileIdMap.set(f.path, f.id);
+      }
+    }
+  } catch {}
+
+  // ── Resume pipeline ──
+  try {
+    onEvent({ type: "plan-approved" });
+
+    try {
+      await apiRequest("PATCH", `/api/sessions/${sessionId}`, { buildStatus: "building" });
+    } catch {}
+
+    for (let phaseIdx = 0; phaseIdx < plan.phases.length; phaseIdx++) {
+      if (signal.aborted) throw new Error("Build cancelled");
+
+      const phaseState = phases[phaseIdx];
+      // Skip fully completed phases
+      if (phaseState?.status === "complete") continue;
+
+      const phase = plan.phases[phaseIdx];
+      onEvent({ type: "phase-start", phaseIndex: phaseIdx });
+
+      // File creation loop — skip already created/updated files
+      let fileIdx = 0;
+      while (fileIdx < phase.files.length) {
+        if (signal.aborted) throw new Error("Build cancelled");
+
+        const fileState = phaseState?.files[fileIdx];
+        if (fileState?.status === "created" || fileState?.status === "updated") {
+          // Already done — just emit created event for UI consistency
+          onEvent({ type: "file-created", phaseIndex: phaseIdx, fileIndex: fileIdx, path: phase.files[fileIdx].path });
+          fileIdx++;
+          continue;
+        }
+
+        const file = phase.files[fileIdx];
+        onEvent({ type: "file-generating", phaseIndex: phaseIdx, fileIndex: fileIdx });
+
+        try {
+          const currentPhasePaths = phase.files.slice(0, fileIdx).map(f => f.path);
+          const filePrompt = buildFileGenerationPrompt(
+            file.path, file.name, file.description, phase.name,
+            buildProjectContext(currentPhasePaths), framework, plan.packageName,
+          );
+
+          const fileContent = await callAI(filePrompt, `Generate ${file.path}`);
+          await writeFile(file.path, file.name, fileContent);
+          reportTokenUsage(filePrompt.length, fileContent.length);
+
+          onEvent({ type: "file-created", phaseIndex: phaseIdx, fileIndex: fileIdx, path: file.path });
+          fileIdx++;
+        } catch (e: any) {
+          if (e.message === "Build cancelled") throw e;
+          const errorMsg = sanitizeError(e.message || "Unknown error");
+          onEvent({ type: "file-error", phaseIndex: phaseIdx, fileIndex: fileIdx, error: errorMsg });
+
+          if (params.onFileError) {
+            const decision = await params.onFileError(file.path, errorMsg);
+            if (decision === 'cancel') throw new Error("Build cancelled");
+            if (decision === 'retry') continue;
+          }
+          fileIdx++;
+        }
+      }
+
+      // Phase review — with cross-phase awareness
+      if (signal.aborted) throw new Error("Build cancelled");
+      onEvent({ type: "phase-reviewing", phaseIndex: phaseIdx });
+
+      try {
+        const phaseFiles = phase.files
+          .filter((f) => fileMemory.has(f.path))
+          .map((f) => ({ path: f.path, content: fileMemory.get(f.path)! }));
+
+        const allProjectFiles = Array.from(fileMemory.entries()).map(([path, content]) => ({ path, content }));
+
+        if (phaseFiles.length > 0) {
+          const reviewPrompt = buildReviewPrompt(phaseFiles, framework, allProjectFiles);
+          const reviewRaw = await callAI(reviewPrompt, "Review these files.");
+
+          let reviewResult: any;
+          try {
+            const cleaned = reviewRaw.replace(/^```(?:json)?\s*\n?/m, "").replace(/\n?```\s*$/m, "").trim();
+            reviewResult = JSON.parse(cleaned);
+          } catch {
+            const jsonMatch = reviewRaw.match(/\{[\s\S]*\}/);
+            if (jsonMatch) {
+              try { reviewResult = JSON.parse(jsonMatch[0]); } catch { reviewResult = { passed: true }; }
+            } else {
+              reviewResult = { passed: true };
+            }
+          }
+
+          if (!reviewResult.passed && Array.isArray(reviewResult.fixes)) {
+            for (const fix of reviewResult.fixes) {
+              if (signal.aborted) throw new Error("Build cancelled");
+
+              // Cross-phase fix: search all phases
+              let fixPhaseIdx = phaseIdx;
+              let fixFileIdx = phase.files.findIndex((f) => f.path === fix.path);
+
+              if (fixFileIdx === -1) {
+                for (let pi = 0; pi < plan.phases.length; pi++) {
+                  const fi = plan.phases[pi].files.findIndex((f) => f.path === fix.path);
+                  if (fi !== -1) {
+                    fixPhaseIdx = pi;
+                    fixFileIdx = fi;
+                    break;
+                  }
+                }
+              }
+
+              if (fixFileIdx === -1) continue;
+              const fixFile = plan.phases[fixPhaseIdx].files[fixFileIdx];
+              onEvent({ type: "file-updating", phaseIndex: fixPhaseIdx, fileIndex: fixFileIdx });
+
+              try {
+                const existingContent = fileMemory.get(fixFile.path);
+                let fixPrompt: string;
+                if (existingContent) {
+                  fixPrompt = buildPatchPrompt(fixFile.path, existingContent, fix.reason, framework, plan.packageName);
+                } else {
+                  fixPrompt = buildFileGenerationPrompt(
+                    fixFile.path, fixFile.name, `${fixFile.description}. FIX REQUIRED: ${fix.reason}`,
+                    phase.name, buildProjectContext(), framework, plan.packageName,
+                  );
+                }
+                const fixedContent = await callAI(fixPrompt, `Fix ${fixFile.path}: ${fix.reason}`);
+                await writeFile(fixFile.path, fixFile.name, fixedContent);
+                reportTokenUsage(fixPrompt.length, fixedContent.length);
+                onEvent({ type: "file-updated", phaseIndex: fixPhaseIdx, fileIndex: fixFileIdx, path: fixFile.path });
+              } catch (e: any) {
+                if (e.message === "Build cancelled") throw e;
+                onEvent({ type: "file-error", phaseIndex: fixPhaseIdx, fileIndex: fixFileIdx, error: e.message || "Fix failed" });
+              }
+            }
+          }
+        }
+      } catch (e: any) {
+        if (e.message === "Build cancelled") throw e;
+        console.error("Phase review error:", e);
+      }
+
+      onEvent({ type: "phase-complete", phaseIndex: phaseIdx });
+    }
+
+    // Final summary
+    if (signal.aborted) throw new Error("Build cancelled");
+    onEvent({ type: "thinking", message: "Generating build summary..." });
+
+    const summaryPrompt = buildSummaryPrompt(plan.pluginName, plan.description, plan.phases, framework);
+    const summary = await callAI(summaryPrompt, "Generate the build completion summary.");
+
+    await apiRequest("POST", `/api/sessions/${sessionId}/messages`, {
+      role: "assistant", content: summary, modelId: model.id,
+    });
+
+    onEvent({ type: "build-complete", summary });
+    try {
+      await apiRequest("PATCH", `/api/sessions/${sessionId}`, { buildStatus: "complete" });
+    } catch {}
+  } catch (e: any) {
+    if (e.message === "Build cancelled" || signal.aborted) {
+      onEvent({ type: "build-error", error: "Build was cancelled" });
+    } else {
+      onEvent({ type: "build-error", error: sanitizeError(e.message || "Build failed unexpectedly") });
+    }
+    try {
+      await apiRequest("PATCH", `/api/sessions/${sessionId}`, { buildStatus: "error" });
+    } catch {}
   }
 }
 

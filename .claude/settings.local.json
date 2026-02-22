@@ -11,7 +11,15 @@
       "Bash(curl:*)",
       "Bash(sudo gpg:*)",
       "Bash(sudo apt-get:*)",
-      "Bash(sudo pg_ctlcluster 17 main start)"
+      "Bash(sudo pg_ctlcluster 17 main start)",
+      "Bash(npx vite build:*)",
+      "Bash(npx esbuild server/index.ts --bundle --platform=node --format=esm --outfile=/dev/null --external:express --external:passport --external:passport-local --external:express-session --external:connect-pg-simple --external:archiver --external:openai --external:drizzle-orm --external:@neondatabase/serverless --external:drizzle-orm/neon-serverless --external:ws --external:zod --external:dotenv --alias:@shared=./shared 2>&1 | tail -10)",
+      "Bash(npx tsx --eval \"import './server/build-runner'; import './server/ai-helper'; console.log\\('Server imports OK'\\)\" 2>&1 | head -10)",
+      "Bash(pg_isready -h localhost -p 5432 2>&1 || service postgresql status 2>&1 || systemctl status postgresql 2>&1 || echo \"PostgreSQL not running\")",
+      "Bash(npx drizzle-kit push 2>&1)",
+      "Bash(pkill -f \"tsx server/index.ts\" 2>/dev/null; sleep 2; echo \"killed\")",
+      "Bash(npm run build 2>&1 | tail -30)",
+      "Bash(npm run build 2>&1 | tail -15)"
     ]
   }
 }

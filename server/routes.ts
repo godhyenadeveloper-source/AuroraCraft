@@ -124,6 +124,27 @@ export async function registerRoutes(
     }
   });
 
+  app.patch("/api/sessions/:id", isAuthenticated, async (req: any, res) => {
+    try {
+      const session = await storage.getSession(parseInt(req.params.id));
+      if (!session || session.userId !== req.user.id) {
+        return res.status(404).json({ message: "Session not found" });
+      }
+      const { buildPlan, buildStatus, name, framework, mode } = req.body;
+      const updates: Record<string, any> = {};
+      if (buildPlan !== undefined) updates.buildPlan = buildPlan;
+      if (buildStatus !== undefined) updates.buildStatus = buildStatus;
+      if (name !== undefined) updates.name = name;
+      if (framework !== undefined) updates.framework = framework;
+      if (mode !== undefined) updates.mode = mode;
+      const updated = await storage.updateSession(session.id, updates);
+      res.json(updated);
+    } catch (error) {
+      console.error("Error updating session:", error);
+      res.status(500).json({ message: "Failed to update session" });
+    }
+  });
+
   app.delete("/api/sessions/:id", isAuthenticated, async (req: any, res) => {
     try {
       const session = await storage.getSession(parseInt(req.params.id));
@@ -932,6 +953,242 @@ export async function registerRoutes(
     }
   });
 
+  // ─── Server-Side Build Endpoints ────────────────────────────────────────
+
+  // Start a new server-side build
+  app.post("/api/sessions/:id/builds", isAuthenticated, async (req: any, res) => {
+    try {
+      const session = await storage.getSession(parseInt(req.params.id));
+      if (!session || session.userId !== req.user.id) {
+        return res.status(404).json({ message: "Session not found" });
+      }
+
+      const { userRequest, modelId } = req.body;
+      if (!userRequest || !modelId) {
+        return res.status(400).json({ message: "userRequest and modelId are required" });
+      }
+
+      // Check for existing active build
+      const existing = await storage.getActiveBuild(session.id);
+      if (existing) {
+        return res.status(409).json({ message: "A build is already active for this session", buildId: existing.id });
+      }
+
+      // Save user message
+      await storage.createMessage({
+        sessionId: session.id,
+        role: "user",
+        content: userRequest,
+        modelId,
+      });
+
+      const build = await storage.createBuild({
+        sessionId: session.id,
+        userId: req.user.id,
+        status: "planning",
+        userRequest,
+        modelId,
+        framework: session.framework || "paper",
+      });
+
+      // Launch build runner in background (fire-and-forget)
+      const { BuildRunner } = await import("./build-runner");
+      const runner = new BuildRunner(build.id);
+      runner.start(build.id).catch((err) => {
+        console.error(`Build ${build.id} failed:`, err);
+      });
+
+      res.json({ buildId: build.id });
+    } catch (error) {
+      console.error("Error starting build:", error);
+      res.status(500).json({ message: "Failed to start build" });
+    }
+  });
+
+  // Get active/latest build state for a session
+  app.get("/api/sessions/:id/builds/current", isAuthenticated, async (req: any, res) => {
+    try {
+      const session = await storage.getSession(parseInt(req.params.id));
+      if (!session || session.userId !== req.user.id) {
+        return res.status(404).json({ message: "Session not found" });
+      }
+
+      const build = await storage.getActiveBuild(session.id);
+      if (!build) {
+        return res.json(null);
+      }
+
+      res.json(build);
+    } catch (error) {
+      console.error("Error fetching build:", error);
+      res.status(500).json({ message: "Failed to fetch build" });
+    }
+  });
+
+  // Approve/edit/cancel a build plan
+  app.post("/api/builds/:id/approve", isAuthenticated, async (req: any, res) => {
+    try {
+      const build = await storage.getBuild(parseInt(req.params.id));
+      if (!build || build.userId !== req.user.id) {
+        return res.status(404).json({ message: "Build not found" });
+      }
+
+      const { action, editInstructions } = req.body;
+      const { getRunner } = await import("./build-runner");
+      const runner = getRunner(build.id);
+
+      if (runner) {
+        runner.resolveApproval({ action, editInstructions });
+        res.json({ success: true });
+      } else {
+        // Runner not in memory — update DB directly
+        if (action === "cancel") {
+          await storage.updateBuild(build.id, { status: "cancelled" });
+        } else if (action === "approve") {
+          await storage.updateBuild(build.id, { status: "building" });
+        }
+        res.json({ success: true, note: "Runner not active, updated DB directly" });
+      }
+    } catch (error) {
+      console.error("Error approving build:", error);
+      res.status(500).json({ message: "Failed to approve build" });
+    }
+  });
+
+  // Cancel a running build
+  app.post("/api/builds/:id/cancel", isAuthenticated, async (req: any, res) => {
+    try {
+      const build = await storage.getBuild(parseInt(req.params.id));
+      if (!build || build.userId !== req.user.id) {
+        return res.status(404).json({ message: "Build not found" });
+      }
+
+      const { getRunner } = await import("./build-runner");
+      const runner = getRunner(build.id);
+      if (runner) {
+        runner.cancel();
+      }
+      await storage.updateBuild(build.id, { status: "cancelled" });
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Error cancelling build:", error);
+      res.status(500).json({ message: "Failed to cancel build" });
+    }
+  });
+
+  // Resume an interrupted build
+  app.post("/api/builds/:id/resume", isAuthenticated, async (req: any, res) => {
+    try {
+      const build = await storage.getBuild(parseInt(req.params.id));
+      if (!build || build.userId !== req.user.id) {
+        return res.status(404).json({ message: "Build not found" });
+      }
+
+      if (!["error", "cancelled"].includes(build.status || "")) {
+        return res.status(400).json({ message: "Build cannot be resumed from current state" });
+      }
+
+      await storage.updateBuild(build.id, { status: "building", error: null });
+
+      const { BuildRunner } = await import("./build-runner");
+      const runner = new BuildRunner(build.id);
+      runner.resume(build.id).catch((err) => {
+        console.error(`Build resume ${build.id} failed:`, err);
+      });
+
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Error resuming build:", error);
+      res.status(500).json({ message: "Failed to resume build" });
+    }
+  });
+
+  // Handle file error retry/cancel decision
+  app.post("/api/builds/:id/file-error-decision", isAuthenticated, async (req: any, res) => {
+    try {
+      const build = await storage.getBuild(parseInt(req.params.id));
+      if (!build || build.userId !== req.user.id) {
+        return res.status(404).json({ message: "Build not found" });
+      }
+
+      const { decision } = req.body; // 'retry' | 'cancel'
+      const { getRunner } = await import("./build-runner");
+      const runner = getRunner(build.id);
+
+      if (runner) {
+        runner.resolveFileError(decision);
+        res.json({ success: true });
+      } else {
+        res.status(404).json({ message: "Build runner not active" });
+      }
+    } catch (error) {
+      console.error("Error handling file error decision:", error);
+      res.status(500).json({ message: "Failed to handle decision" });
+    }
+  });
+
+  // SSE endpoint for live build progress
+  app.get("/api/builds/:id/stream", isAuthenticated, async (req: any, res) => {
+    try {
+      const build = await storage.getBuild(parseInt(req.params.id));
+      if (!build || build.userId !== req.user.id) {
+        return res.status(404).json({ message: "Build not found" });
+      }
+
+      // Set up SSE
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+      res.setHeader("X-Accel-Buffering", "no");
+
+      // Subscribe to live events if runner is active
+      const { getRunner } = await import("./build-runner");
+      const runner = getRunner(build.id);
+
+      // Send current state snapshot first — merge runner's live state if available
+      const runnerSnapshot = runner?.getSnapshot();
+      const snapshot = {
+        type: "snapshot" as const,
+        state: {
+          buildId: build.id,
+          status: runnerSnapshot?.status || build.status,
+          plan: runnerSnapshot?.plan || build.plan,
+          phases: runnerSnapshot?.phases || build.phases,
+          thinkingMessage: build.thinkingMessage,
+          summary: build.summary,
+          error: build.error,
+          pendingFileError: runnerSnapshot?.pendingFileError || null,
+        },
+      };
+      res.write(`data: ${JSON.stringify(snapshot)}\n\n`);
+
+      if (runner) {
+        const onEvent = (event: any) => {
+          try {
+            res.write(`data: ${JSON.stringify(event)}\n\n`);
+          } catch {
+            // Client disconnected
+          }
+        };
+
+        runner.emitter.on("event", onEvent);
+
+        req.on("close", () => {
+          runner.emitter.off("event", onEvent);
+        });
+      } else {
+        // No active runner — just close after snapshot
+        res.write(`data: ${JSON.stringify({ type: "done" })}\n\n`);
+        res.end();
+      }
+    } catch (error) {
+      console.error("Error in build stream:", error);
+      if (!res.headersSent) {
+        res.status(500).json({ message: "Failed to stream build" });
+      }
+    }
+  });
+
   // Lightweight AI generate proxy — streams AI responses via SSE.
   // Does NOT save messages, does NOT deduct tokens. The build engine handles that.
   app.post("/api/ai/generate", isAuthenticated, async (req: any, res) => {
@@ -948,8 +1205,11 @@ export async function registerRoutes(
       }
 
       const provider = await storage.getProvider(model.providerId);
-      if (!provider || !provider.apiKey) {
-        return res.status(400).json({ message: "Provider not configured or missing API key" });
+      if (!provider) {
+        return res.status(404).json({ message: "Provider not found" });
+      }
+      if (!provider.apiKey) {
+        return res.status(400).json({ message: `API key not configured for ${provider.name}. Please add your API key in the admin panel.` });
       }
 
       // Set up SSE headers
@@ -958,51 +1218,153 @@ export async function registerRoutes(
       res.setHeader("Connection", "keep-alive");
       res.setHeader("X-Accel-Buffering", "no");
 
+      const chatMessages = [
+        { role: "system" as const, content: systemPrompt },
+        ...(messages || []).map((m: any) => ({
+          role: m.role as "user" | "assistant",
+          content: m.content,
+        })),
+      ];
+
+      const inputChars = chatMessages.reduce((sum, m) => sum + m.content.length, 0);
+      let outputChars = 0;
+      let finishReason = "";
+
       try {
-        const openai = new OpenAI({
-          apiKey: provider.apiKey,
-          baseURL: provider.baseUrl,
-        });
+        // Handle Google Gemini API
+        if (provider.name.toLowerCase() === "google") {
+          const modelName = model.name.includes("/") ? model.name.split("/").pop() : model.name;
+          const url = `${provider.baseUrl}models/${modelName}:streamGenerateContent?key=${provider.apiKey}&alt=sse`;
+          
+          const contents = chatMessages.slice(1).map((m: any) => ({
+            role: m.role === "assistant" ? "model" : "user",
+            parts: [{ text: m.content }]
+          }));
 
-        const chatMessages = [
-          { role: "system" as const, content: systemPrompt },
-          ...(messages || []).map((m: any) => ({
-            role: m.role as "user" | "assistant",
-            content: m.content,
-          })),
-        ];
+          const response = await fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              systemInstruction: { parts: [{ text: systemPrompt }] },
+              contents,
+              generationConfig: { maxOutputTokens: maxTokens || 4096 }
+            }),
+          });
 
-        const inputChars = chatMessages.reduce((sum, m) => sum + m.content.length, 0);
-
-        const stream = await openai.chat.completions.create({
-          model: model.name,
-          messages: chatMessages,
-          max_completion_tokens: maxTokens || 4096,
-          stream: true,
-        });
-
-        let outputChars = 0;
-        let finishReason = "";
-
-        for await (const chunk of stream) {
-          const text = chunk.choices[0]?.delta?.content || "";
-          if (text) {
-            outputChars += text.length;
-            res.write(`data: ${JSON.stringify({ type: "chunk", content: text })}\n\n`);
+          if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`API error: ${response.status} - ${errorText}`);
           }
-          if (chunk.choices[0]?.finish_reason) {
-            finishReason = chunk.choices[0].finish_reason;
+
+          const reader = response.body?.getReader();
+          const decoder = new TextDecoder();
+          
+          while (reader) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            
+            const chunk = decoder.decode(value);
+            const lines = chunk.split("\n").filter(line => line.startsWith("data: "));
+            
+            for (const line of lines) {
+              try {
+                const data = JSON.parse(line.slice(6));
+                const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+                if (text) {
+                  outputChars += text.length;
+                  res.write(`data: ${JSON.stringify({ type: "chunk", content: text })}\n\n`);
+                }
+                if (data.candidates?.[0]?.finishReason) {
+                  finishReason = data.candidates[0].finishReason;
+                }
+              } catch {}
+            }
           }
+
+          res.write(`data: ${JSON.stringify({ type: "done", inputChars, outputChars, finishReason })}\n\n`);
+          res.end();
         }
+        // Handle Bytez-style API (model in URL path, direct API key auth)
+        else if (provider.authType === "api_key" || provider.name.toLowerCase() === "bytez") {
+          const url = `${provider.baseUrl}${model.name}`;
+          
+          const response = await fetch(url, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": provider.apiKey,
+            },
+            body: JSON.stringify({
+              messages: chatMessages,
+              max_tokens: maxTokens || 4096,
+            }),
+          });
 
-        res.write(`data: ${JSON.stringify({ type: "done", inputChars, outputChars, finishReason })}\n\n`);
-        res.end();
-      } catch (aiError) {
-        console.error("AI generate error:", aiError);
-        if (!res.headersSent) {
-          res.status(500).json({ message: "AI generation failed" });
+          if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`API error: ${response.status} - ${errorText}`);
+          }
+
+          const data = await response.json();
+          const content = data.choices?.[0]?.message?.content || data.output || data.response || "";
+          outputChars = content.length;
+          finishReason = data.choices?.[0]?.finish_reason || "stop";
+          
+          res.write(`data: ${JSON.stringify({ type: "chunk", content })}\n\n`);
+          res.write(`data: ${JSON.stringify({ type: "done", inputChars, outputChars, finishReason })}\n\n`);
+          res.end();
         } else {
-          res.write(`data: ${JSON.stringify({ type: "error", content: "AI generation failed" })}\n\n`);
+          // OpenAI-compatible providers
+          const openai = new OpenAI({
+            apiKey: provider.apiKey,
+            baseURL: provider.baseUrl,
+          });
+
+          const stream = await openai.chat.completions.create({
+            model: model.name,
+            messages: chatMessages,
+            max_completion_tokens: maxTokens || 4096,
+            stream: true,
+          });
+
+          for await (const chunk of stream) {
+            const text = chunk.choices[0]?.delta?.content || "";
+            if (text) {
+              outputChars += text.length;
+              res.write(`data: ${JSON.stringify({ type: "chunk", content: text })}\n\n`);
+            }
+            if (chunk.choices[0]?.finish_reason) {
+              finishReason = chunk.choices[0].finish_reason;
+            }
+          }
+
+          res.write(`data: ${JSON.stringify({ type: "done", inputChars, outputChars, finishReason })}\n\n`);
+          res.end();
+        }
+      } catch (aiError: any) {
+        console.error("AI generate error:", aiError);
+        let errorMsg = "AI generation failed";
+        let errorDetails = "";
+        
+        if (aiError?.status === 401 || aiError?.status === 403) {
+          errorMsg = `Authentication failed for ${provider.name}. Please check your API key.`;
+          errorDetails = "Invalid or expired API key. Get a new key from the provider's website.";
+        } else if (aiError?.status === 404) {
+          errorMsg = `Model "${model.name}" not found on ${provider.name}.`;
+          errorDetails = "The model may have been renamed or removed.";
+        } else if (aiError?.status === 429) {
+          errorMsg = "Rate limit exceeded. Please try again later.";
+          errorDetails = "Too many requests to the API.";
+        } else if (aiError?.message) {
+          errorMsg = aiError.message;
+          if (aiError?.error) errorDetails = JSON.stringify(aiError.error);
+        }
+        
+        console.error("AI error details:", errorDetails || aiError?.status);
+        if (!res.headersSent) {
+          res.status(500).json({ message: errorMsg, details: errorDetails });
+        } else {
+          res.write(`data: ${JSON.stringify({ type: "error", content: errorMsg, details: errorDetails })}\n\n`);
           res.end();
         }
       }

@@ -8,6 +8,7 @@ import {
   compilations,
   tokenUsage,
   siteSettings,
+  builds,
   type User,
   type UpsertUser,
   type Provider,
@@ -26,6 +27,8 @@ import {
   type InsertTokenUsage,
   type SiteSetting,
   type InsertSiteSetting,
+  type Build,
+  type InsertBuild,
 } from "@shared/schema";
 import { db } from "./db";
 import { eq, desc, and, ne, or, sql } from "drizzle-orm";
@@ -96,6 +99,12 @@ export interface IStorage {
   // Token usage operations
   createTokenUsage(data: InsertTokenUsage): Promise<TokenUsage>;
   getUserTokenUsage(userId: string): Promise<TokenUsage[]>;
+
+  // Build operations
+  createBuild(data: InsertBuild): Promise<Build>;
+  getBuild(id: number): Promise<Build | undefined>;
+  getActiveBuild(sessionId: number): Promise<Build | undefined>;
+  updateBuild(id: number, data: Partial<InsertBuild>): Promise<Build | undefined>;
 
   // Site settings operations
   getSettings(): Promise<SiteSetting[]>;
@@ -262,6 +271,8 @@ export class DatabaseStorage implements IStorage {
   }
 
   async deleteSession(id: number): Promise<void> {
+    await db.delete(tokenUsage).where(eq(tokenUsage.sessionId, id));
+    await db.delete(builds).where(eq(builds.sessionId, id));
     await db.delete(chatMessages).where(eq(chatMessages.sessionId, id));
     await db.delete(projectFiles).where(eq(projectFiles.sessionId, id));
     await db.delete(compilations).where(eq(compilations.sessionId, id));
@@ -354,6 +365,41 @@ export class DatabaseStorage implements IStorage {
       .from(tokenUsage)
       .where(eq(tokenUsage.userId, userId))
       .orderBy(desc(tokenUsage.createdAt));
+  }
+
+  // Build operations
+  async createBuild(data: InsertBuild): Promise<Build> {
+    const [build] = await db.insert(builds).values(data).returning();
+    return build;
+  }
+
+  async getBuild(id: number): Promise<Build | undefined> {
+    const [build] = await db.select().from(builds).where(eq(builds.id, id));
+    return build;
+  }
+
+  async getActiveBuild(sessionId: number): Promise<Build | undefined> {
+    const [build] = await db
+      .select()
+      .from(builds)
+      .where(
+        and(
+          eq(builds.sessionId, sessionId),
+          sql`${builds.status} NOT IN ('complete', 'error', 'cancelled')`
+        )
+      )
+      .orderBy(desc(builds.createdAt))
+      .limit(1);
+    return build;
+  }
+
+  async updateBuild(id: number, data: Partial<InsertBuild>): Promise<Build | undefined> {
+    const [build] = await db
+      .update(builds)
+      .set({ ...data, updatedAt: new Date() })
+      .where(eq(builds.id, id))
+      .returning();
+    return build;
   }
 
   // Site settings operations
