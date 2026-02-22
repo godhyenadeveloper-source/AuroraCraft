@@ -23,18 +23,11 @@ function getProjectFileSummary(files: ProjectFile[]): string {
     return "No files created yet.";
   }
 
-  const javaFiles = files.filter(f => f.name.endsWith(".java"));
-  const configFiles = files.filter(f => 
-    f.name.endsWith(".yml") || f.name.endsWith(".yaml") || f.name.endsWith(".xml")
-  );
+  let summary = `Current project has ${files.length} files.\n\n### Full Project Files:\n`;
 
-  let summary = `Current project has ${files.length} files:\n`;
-  
-  if (javaFiles.length > 0) {
-    summary += `- Java classes: ${javaFiles.map(f => f.name).join(", ")}\n`;
-  }
-  if (configFiles.length > 0) {
-    summary += `- Config files: ${configFiles.map(f => f.name).join(", ")}\n`;
+  for (const f of files) {
+    if (f.isFolder || !f.content) continue;
+    summary += `\n--- ${f.path} ---\n${f.content}\n--- end ${f.path} ---\n`;
   }
 
   return summary;
@@ -270,8 +263,12 @@ Only respond with the enhanced prompt text, nothing else.`;
 }
 
 export function buildErrorFixPrompt(errorLogs: string, files: ProjectFile[]): string {
-  const fileList = files.map(f => `- ${f.path}`).join("\n");
-  
+  let fileContents = "";
+  for (const f of files) {
+    if (f.isFolder || !f.content) continue;
+    fileContents += `\n--- ${f.path} ---\n${f.content}\n--- end ${f.path} ---\n`;
+  }
+
   return `The compilation failed with the following errors. Analyze them carefully and provide fixed file contents.
 
 ## Compilation Errors:
@@ -280,7 +277,7 @@ ${errorLogs}
 \`\`\`
 
 ## Current Project Files:
-${fileList}
+${fileContents}
 
 ## Instructions:
 1. Identify the root cause of each error

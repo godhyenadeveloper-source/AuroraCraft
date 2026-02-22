@@ -51,7 +51,8 @@ export default function TokensPage() {
     }
   };
 
-  const formatDate = (date: string | Date) => {
+  const formatDate = (date: string | Date | null) => {
+    if (!date) return "Unknown";
     return new Date(date).toLocaleDateString("en-US", {
       month: "short",
       day: "numeric",

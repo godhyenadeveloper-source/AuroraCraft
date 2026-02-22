@@ -96,7 +96,25 @@ async function generateWithServer(options: AIGenerateOptions): Promise<AIGenerat
 
   if (!response.ok) {
     const errorText = await response.text().catch(() => "Unknown error");
-    throw new Error(`AI generation failed: ${response.status} ${errorText}`);
+    // Parse error into a clean, user-friendly message
+    let cleanMessage = "AI generation failed";
+    try {
+      const errorJson = JSON.parse(errorText);
+      cleanMessage = errorJson.message || errorJson.error || cleanMessage;
+    } catch {
+      const firstLine = errorText.split("\n")[0].replace(/<[^>]*>/g, "").trim();
+      if (firstLine.length > 0 && firstLine.length < 200) {
+        cleanMessage = firstLine;
+      }
+    }
+    if (response.status === 401 || response.status === 403) {
+      cleanMessage = "Authentication failed. Please check your API key.";
+    } else if (response.status === 429) {
+      cleanMessage = "Rate limit exceeded. Please try again in a moment.";
+    } else if (response.status === 404) {
+      cleanMessage = "Model not found. It may have been renamed or removed.";
+    }
+    throw new Error(cleanMessage);
   }
 
   const reader = response.body?.getReader();

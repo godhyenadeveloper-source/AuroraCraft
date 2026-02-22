@@ -76,6 +76,8 @@ export const chatSessions = pgTable("chat_sessions", {
   projectType: varchar("project_type").default("minecraft"), // minecraft, discord, web
   framework: varchar("framework").default("paper"), // paper, bukkit, spigot, etc.
   mode: varchar("mode").default("agent"), // agent, plan, question
+  buildPlan: jsonb("build_plan"),               // structured BuildPlan JSON
+  buildStatus: varchar("build_status").default("idle"), // idle, awaiting-approval, building, complete, error
   createdAt: timestamp("created_at").defaultNow(),
   updatedAt: timestamp("updated_at").defaultNow(),
 });
@@ -115,6 +117,28 @@ export const compilations = pgTable("compilations", {
   startedAt: timestamp("started_at"),
   completedAt: timestamp("completed_at"),
   createdAt: timestamp("created_at").defaultNow(),
+});
+
+// Builds — server-side build pipeline state
+export const builds = pgTable("builds", {
+  id: serial("id").primaryKey(),
+  sessionId: integer("session_id").references(() => chatSessions.id),
+  userId: varchar("user_id").references(() => users.id),
+  status: varchar("status").default("planning"),
+  // planning | awaiting-approval | building | reviewing | complete | error | cancelled
+  plan: jsonb("plan"),               // BuildPlan JSON
+  phases: jsonb("phases"),           // PhaseState[] JSON with current progress
+  currentPhaseIndex: integer("current_phase_index").default(0),
+  currentFileIndex: integer("current_file_index").default(0),
+  thinkingMessage: varchar("thinking_message"),
+  summary: text("summary"),
+  error: text("error"),
+  userRequest: text("user_request").notNull(),
+  modelId: integer("model_id").references(() => models.id),
+  framework: varchar("framework").default("paper"),
+  fileMemory: jsonb("file_memory"),  // Record<path, content> for AI context
+  createdAt: timestamp("created_at").defaultNow(),
+  updatedAt: timestamp("updated_at").defaultNow(),
 });
 
 // Token Usage History
@@ -161,6 +185,22 @@ export const chatSessionsRelations = relations(chatSessions, ({ one, many }) => 
   messages: many(chatMessages),
   files: many(projectFiles),
   compilations: many(compilations),
+  builds: many(builds),
+}));
+
+export const buildsRelations = relations(builds, ({ one }) => ({
+  session: one(chatSessions, {
+    fields: [builds.sessionId],
+    references: [chatSessions.id],
+  }),
+  user: one(users, {
+    fields: [builds.userId],
+    references: [users.id],
+  }),
+  model: one(models, {
+    fields: [builds.modelId],
+    references: [models.id],
+  }),
 }));
 
 export const chatMessagesRelations = relations(chatMessages, ({ one }) => ({
@@ -242,6 +282,12 @@ export const insertCompilationSchema = createInsertSchema(compilations).omit({
   createdAt: true,
 });
 
+export const insertBuildSchema = createInsertSchema(builds).omit({
+  id: true,
+  createdAt: true,
+  updatedAt: true,
+});
+
 export const insertTokenUsageSchema = createInsertSchema(tokenUsage).omit({
   id: true,
   createdAt: true,
@@ -274,6 +320,9 @@ export type InsertProjectFile = z.infer<typeof insertProjectFileSchema>;
 
 export type Compilation = typeof compilations.$inferSelect;
 export type InsertCompilation = z.infer<typeof insertCompilationSchema>;
+
+export type Build = typeof builds.$inferSelect;
+export type InsertBuild = z.infer<typeof insertBuildSchema>;
 
 export type TokenUsage = typeof tokenUsage.$inferSelect;
 export type InsertTokenUsage = z.infer<typeof insertTokenUsageSchema>;
