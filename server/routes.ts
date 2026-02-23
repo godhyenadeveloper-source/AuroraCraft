@@ -12,6 +12,9 @@ import { z } from "zod";
 import archiver from "archiver";
 import OpenAI from "openai";
 import { buildSystemPrompt, buildEnhancePrompt, buildErrorFixPrompt } from "./prompts";
+import { classifyThinkingType, resolveThinkingContext } from "@shared/thinking-types";
+import { parseThinking } from "@shared/thinking-parser";
+import { memoryService } from "./memory";
 
 function isBuiltInProvider(provider: any): boolean {
   return provider?.authType === "puterjs";
@@ -213,18 +216,22 @@ export async function registerRoutes(
         return res.status(404).json({ message: "Session not found" });
       }
 
-      const { mode } = req.body;
+      const { mode, userMessage } = req.body;
 
       const files = await storage.getFiles(session.id);
       const compilations = await storage.getCompilations(session.id);
       const previousMessages = await storage.getMessages(session.id);
 
+      // Include thinking instructions in the system prompt for Puter.js clients
+      const puterThinking = classifyThinkingType("conversation", { userRequest: userMessage || "" });
+      const memoryContext = await memoryService.getContextForAI(req.user.id, session.id);
       const systemPrompt = buildSystemPrompt(mode || session.mode || "agent", {
         session,
         files,
         recentMessages: previousMessages.slice(-10),
         latestCompilation: compilations[0],
-      });
+        memoryContext,
+      }, puterThinking);
 
       res.json({ systemPrompt });
     } catch (error) {
@@ -273,12 +280,15 @@ export async function registerRoutes(
               const files = await storage.getFiles(session.id);
               const compilations = await storage.getCompilations(session.id);
               
+              const chatThinking = classifyThinkingType("conversation", { userRequest: content });
+              const memoryContext = await memoryService.getContextForAI(req.user.id, session.id);
               const systemPrompt = buildSystemPrompt(mode, {
                 session,
                 files,
                 recentMessages: previousMessages.slice(-10),
                 latestCompilation: compilations[0],
-              });
+                memoryContext,
+              }, chatThinking);
 
               const response = await openai.chat.completions.create({
                 model: model.name,
@@ -293,7 +303,10 @@ export async function registerRoutes(
                 max_completion_tokens: 4096,
               });
 
-              aiResponse = response.choices[0]?.message?.content || aiResponse;
+              const rawResponse = response.choices[0]?.message?.content || aiResponse;
+              // Strip thinking tags — only save the visible output
+              const { output } = parseThinking(rawResponse);
+              aiResponse = output;
             } catch (aiError) {
               console.error("AI error:", aiError);
               aiResponse = "I encountered an error processing your request. Please try again.";
@@ -335,6 +348,37 @@ export async function registerRoutes(
 
       // Update session
       await storage.updateSession(session.id, { mode });
+
+      // Auto-write preference to personal memory
+      try {
+        const preferenceKeywords = [
+          "prefer", "always use", "style", "convention", "never", "approach",
+          "don't use", "avoid", "i like", "i want", "default to",
+          "naming convention", "code style", "keep using",
+        ];
+        if (preferenceKeywords.some(kw => content.toLowerCase().includes(kw))) {
+          await memoryService.write({
+            scope: "personal",
+            ownerId: userId,
+            content: `User preference: ${content.slice(0, 300)}`,
+            tags: ["preference"],
+          });
+        }
+      } catch {}
+
+      // Auto-write project architecture instructions
+      try {
+        const archKeywords = ["this plugin", "the plugin", "main class", "store data", "database", "should use", "architecture"];
+        if (archKeywords.some(kw => content.toLowerCase().includes(kw)) && session?.id) {
+          await memoryService.write({
+            scope: "project",
+            ownerId: userId,
+            projectId: session.id,
+            content: `User instruction: ${content.slice(0, 400)}`,
+            tags: ["user-instruction"],
+          });
+        }
+      } catch {}
 
       res.json(assistantMessage);
     } catch (error) {
@@ -388,12 +432,15 @@ export async function registerRoutes(
               const files = await storage.getFiles(session.id);
               const compilations = await storage.getCompilations(session.id);
               
+              const streamChatThinking = classifyThinkingType("conversation", { userRequest: content });
+              const streamMemoryContext = await memoryService.getContextForAI(req.user.id, session.id);
               const systemPrompt = buildSystemPrompt(mode, {
                 session,
                 files,
                 recentMessages: previousMessages.slice(-10),
                 latestCompilation: compilations[0],
-              });
+                memoryContext: streamMemoryContext,
+              }, streamChatThinking);
 
               const stream = await openai.chat.completions.create({
                 model: model.name,
@@ -416,6 +463,18 @@ export async function registerRoutes(
                   res.write(`data: ${JSON.stringify({ type: "chunk", content: text })}\n\n`);
                 }
               }
+
+              // After streaming, parse thinking from the full response
+              const { thinking: streamThinkContent, output: cleanResponse } = parseThinking(fullResponse);
+              if (streamThinkContent) {
+                const thinkCtx = resolveThinkingContext(streamChatThinking.typeId, streamChatThinking.level);
+                res.write(`data: ${JSON.stringify({
+                  type: "thinking-data",
+                  context: { ...thinkCtx, content: streamThinkContent },
+                })}\n\n`);
+              }
+              // Replace fullResponse with clean version for DB storage
+              fullResponse = cleanResponse;
             } catch (aiError) {
               console.error("AI streaming error:", aiError);
               fullResponse = "I encountered an error processing your request. Please try again.";
@@ -463,6 +522,37 @@ export async function registerRoutes(
 
       // Update session
       await storage.updateSession(session.id, { mode });
+
+      // Auto-write preference to personal memory
+      try {
+        const streamPreferenceKeywords = [
+          "prefer", "always use", "style", "convention", "never", "approach",
+          "don't use", "avoid", "i like", "i want", "default to",
+          "naming convention", "code style", "keep using",
+        ];
+        if (streamPreferenceKeywords.some(kw => content.toLowerCase().includes(kw))) {
+          await memoryService.write({
+            scope: "personal",
+            ownerId: userId,
+            content: `User preference: ${content.slice(0, 300)}`,
+            tags: ["preference"],
+          });
+        }
+      } catch {}
+
+      // Auto-write project architecture instructions
+      try {
+        const streamArchKeywords = ["this plugin", "the plugin", "main class", "store data", "database", "should use", "architecture"];
+        if (streamArchKeywords.some(kw => content.toLowerCase().includes(kw)) && session?.id) {
+          await memoryService.write({
+            scope: "project",
+            ownerId: userId,
+            projectId: session.id,
+            content: `User instruction: ${content.slice(0, 400)}`,
+            tags: ["user-instruction"],
+          });
+        }
+      } catch {}
 
       // Send completion event
       res.write(`data: ${JSON.stringify({ type: "done", messageId: assistantMessage.id, tokensUsed })}\n\n`);
@@ -719,6 +809,129 @@ export async function registerRoutes(
     }
   });
 
+  // ─── Memory endpoints ─────────────────────────────────────────────
+
+  // Get merged memory context for client-side build engine
+  app.get("/api/sessions/:id/memory-context", isAuthenticated, async (req: any, res) => {
+    try {
+      const session = await storage.getSession(parseInt(req.params.id));
+      if (!session || session.userId !== req.user.id) {
+        return res.status(404).json({ message: "Session not found" });
+      }
+      const context = await memoryService.getContextForAI(req.user.id, session.id);
+      res.json({ context });
+    } catch (error) {
+      console.error("Error fetching memory context:", error);
+      res.status(500).json({ message: "Failed to fetch memory context" });
+    }
+  });
+
+  // View project memories for a session
+  app.get("/api/sessions/:id/memories", isAuthenticated, async (req: any, res) => {
+    try {
+      const session = await storage.getSession(parseInt(req.params.id));
+      if (!session || session.userId !== req.user.id) {
+        return res.status(404).json({ message: "Session not found" });
+      }
+      const mems = await memoryService.read("project", { projectId: session.id });
+      res.json(mems.filter((m: any) => !m.isInternal));
+    } catch (error) {
+      console.error("Error fetching project memories:", error);
+      res.status(500).json({ message: "Failed to fetch project memories" });
+    }
+  });
+
+  // View personal memories for current user
+  app.get("/api/memories/personal", isAuthenticated, async (req: any, res) => {
+    try {
+      const mems = await memoryService.read("personal", { ownerId: req.user.id });
+      res.json(mems.filter((m: any) => !m.isInternal));
+    } catch (error) {
+      console.error("Error fetching personal memories:", error);
+      res.status(500).json({ message: "Failed to fetch personal memories" });
+    }
+  });
+
+  // Search memories
+  app.get("/api/memories/search", isAuthenticated, async (req: any, res) => {
+    try {
+      const { scope, keyword, projectId } = req.query;
+      if (!scope || !keyword) {
+        return res.status(400).json({ message: "scope and keyword are required" });
+      }
+      const results = await memoryService.search(
+        scope as string,
+        keyword as string,
+        {
+          ownerId: scope === "personal" ? req.user.id : undefined,
+          projectId: projectId ? parseInt(projectId as string) : undefined,
+        },
+      );
+      res.json(results.filter((m: any) => !m.isInternal));
+    } catch (error) {
+      console.error("Error searching memories:", error);
+      res.status(500).json({ message: "Failed to search memories" });
+    }
+  });
+
+  // Write project-scoped memory (for client-side builds)
+  app.post("/api/sessions/:id/memories", isAuthenticated, async (req: any, res) => {
+    try {
+      const session = await storage.getSession(parseInt(req.params.id));
+      if (!session || session.userId !== req.user.id) {
+        return res.status(404).json({ message: "Session not found" });
+      }
+      const { content, tags } = req.body;
+      if (!content) return res.status(400).json({ message: "content is required" });
+      const memory = await memoryService.write({
+        scope: "project",
+        ownerId: req.user.id,
+        projectId: session.id,
+        content,
+        tags: tags || [],
+      });
+      res.json(memory);
+    } catch (error) {
+      console.error("Error writing project memory:", error);
+      res.status(500).json({ message: "Failed to write project memory" });
+    }
+  });
+
+  // Write personal-scoped memory (for client-side builds)
+  app.post("/api/memories/personal", isAuthenticated, async (req: any, res) => {
+    try {
+      const { content, tags } = req.body;
+      if (!content) return res.status(400).json({ message: "content is required" });
+      const memory = await memoryService.write({
+        scope: "personal",
+        ownerId: req.user.id,
+        content,
+        tags: tags || [],
+      });
+      res.json(memory);
+    } catch (error) {
+      console.error("Error writing personal memory:", error);
+      res.status(500).json({ message: "Failed to write personal memory" });
+    }
+  });
+
+  // Update file structure map (for client-side builds)
+  app.post("/api/sessions/:id/file-structure-map", isAuthenticated, async (req: any, res) => {
+    try {
+      const session = await storage.getSession(parseInt(req.params.id));
+      if (!session || session.userId !== req.user.id) {
+        return res.status(404).json({ message: "Session not found" });
+      }
+      const { fileEntries } = req.body;
+      if (!Array.isArray(fileEntries)) return res.status(400).json({ message: "fileEntries array is required" });
+      await memoryService.updateFileStructureMap(session.id, req.user.id, fileEntries);
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Error updating file structure map:", error);
+      res.status(500).json({ message: "Failed to update file structure map" });
+    }
+  });
+
   // Admin routes
   app.get("/api/admin/users", isAuthenticated, isAdmin, async (req, res) => {
     try {
@@ -890,6 +1103,70 @@ export async function registerRoutes(
     } catch (error) {
       console.error("Error fetching stats:", error);
       res.status(500).json({ message: "Failed to fetch stats" });
+    }
+  });
+
+  // ─── Admin memory management ──────────────────────────────────────
+
+  app.get("/api/admin/memories", isAuthenticated, isAdmin, async (req, res) => {
+    try {
+      const mems = await memoryService.read("global", {});
+      res.json(mems);
+    } catch (error) {
+      console.error("Error fetching global memories:", error);
+      res.status(500).json({ message: "Failed to fetch global memories" });
+    }
+  });
+
+  app.post("/api/admin/memories", isAuthenticated, isAdmin, async (req: any, res) => {
+    try {
+      const { content, tags, isInternal } = req.body;
+      if (!content) {
+        return res.status(400).json({ message: "content is required" });
+      }
+      const memory = await memoryService.write({
+        scope: "global",
+        content,
+        tags: tags || [],
+        isInternal: isInternal || false,
+      });
+      res.json(memory);
+    } catch (error) {
+      console.error("Error creating global memory:", error);
+      res.status(500).json({ message: "Failed to create global memory" });
+    }
+  });
+
+  app.put("/api/admin/memories/:id", isAuthenticated, isAdmin, async (req: any, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const { content, tags } = req.body;
+      if (!content) {
+        return res.status(400).json({ message: "content is required" });
+      }
+      const memory = await memoryService.update(id, content, tags);
+      if (!memory) {
+        return res.status(404).json({ message: "Memory not found" });
+      }
+      res.json(memory);
+    } catch (error) {
+      console.error("Error updating global memory:", error);
+      res.status(500).json({ message: "Failed to update global memory" });
+    }
+  });
+
+  app.delete("/api/admin/memories/:id", isAuthenticated, isAdmin, async (req: any, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const memory = await memoryService.getById(id);
+      if (!memory) {
+        return res.status(404).json({ message: "Memory not found" });
+      }
+      await memoryService.delete(id);
+      res.json({ message: "Memory deleted" });
+    } catch (error) {
+      console.error("Error deleting global memory:", error);
+      res.status(500).json({ message: "Failed to delete global memory" });
     }
   });
 

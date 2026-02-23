@@ -5,6 +5,7 @@ import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { MarkdownRenderer } from "@/components/markdown-renderer";
 import type { BuildPlan, PhaseState, FileState } from "@/lib/build-engine";
+import type { ThinkingContext } from "@shared/thinking-types";
 import {
   Loader2,
   Check,
@@ -20,6 +21,8 @@ import {
   AlertCircle,
   Eye,
   Trash2,
+  Brain,
+  ChevronDown,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -239,6 +242,52 @@ export function BuildThinkingIndicator({ message }: { message: string }) {
       <div className="flex items-center gap-2 rounded-xl px-4 py-3 bg-card border border-card-border">
         <Loader2 className="w-4 h-4 animate-spin text-primary" />
         <span className="text-sm text-muted-foreground">{message}</span>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Collapsible thinking block — shows the AI's reasoning for an operation.
+ * Collapsed by default; click to expand/collapse.
+ */
+export function ThinkingBlock({ context }: { context: ThinkingContext }) {
+  const [isOpen, setIsOpen] = useState(false);
+
+  if (!context.content) return null;
+
+  return (
+    <div className="flex gap-3">
+      <div className="w-8 h-8 rounded-full bg-purple-500/20 flex items-center justify-center shrink-0">
+        <Brain className="w-4 h-4 text-purple-400" />
+      </div>
+      <div
+        className="max-w-[85%] rounded-xl border border-purple-500/20 bg-card overflow-hidden cursor-pointer select-none"
+        onClick={() => setIsOpen(!isOpen)}
+      >
+        <div className="flex items-center justify-between gap-3 px-3 py-2">
+          <div className="flex items-center gap-2 min-w-0">
+            <span className="text-xs font-medium text-purple-400 whitespace-nowrap">
+              {context.typeName}
+            </span>
+            <span className="text-[10px] text-muted-foreground whitespace-nowrap">
+              Level {context.level} · {context.levelName}
+            </span>
+          </div>
+          <ChevronDown
+            className={cn(
+              "w-3.5 h-3.5 text-muted-foreground transition-transform duration-200 shrink-0",
+              isOpen && "rotate-180",
+            )}
+          />
+        </div>
+        {isOpen && (
+          <div className="px-3 pb-2.5 pt-0 border-t border-purple-500/10">
+            <p className="text-xs text-muted-foreground whitespace-pre-wrap leading-relaxed mt-2">
+              {context.content}
+            </p>
+          </div>
+        )}
       </div>
     </div>
   );

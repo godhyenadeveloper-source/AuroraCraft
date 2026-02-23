@@ -53,6 +53,7 @@ import {
   BuildErrorMessage,
   BuildInterruptedMessage,
   BuildFileErrorActions,
+  ThinkingBlock,
 } from "@/components/build-messages";
 import {
   runBuild,
@@ -64,6 +65,7 @@ import {
   type BuildPlan,
 } from "@/lib/build-engine";
 import type { ChatSession, ChatMessage, Model, ProjectFile, Compilation } from "@shared/schema";
+import { parseStreamingThinking } from "@shared/thinking-parser";
 import {
   AlertCircle,
   ArrowLeft,
@@ -316,6 +318,7 @@ export default function ChatPage() {
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set(["src"]));
   const [editorContent, setEditorContent] = useState("");
   const [streamingContent, setStreamingContent] = useState("");
+  const [chatThinking, setChatThinking] = useState<{ typeId: string; typeName: string; level: number; levelName: string; content: string } | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
 
   // Server-side build tracking
@@ -548,11 +551,11 @@ export default function ChatPage() {
       modelId: selectedModel ? parseInt(selectedModel) : undefined,
     });
 
-    // Build system prompt with full server-side context
+    // Build system prompt with full server-side context (include user message for thinking classification)
     const systemPromptResponse = await apiRequest(
       "POST",
       `/api/sessions/${sessionId}/system-prompt`,
-      { mode }
+      { mode, userMessage: content }
     );
     const systemPromptData = await systemPromptResponse.json();
     const systemPrompt: string | undefined = systemPromptData.systemPrompt;
@@ -584,13 +587,26 @@ export default function ChatPage() {
     }
 
     if (!abortController.signal.aborted && fullText) {
+      // Parse thinking from full response
+      const parsedFinal = parseStreamingThinking(fullText);
+      if (parsedFinal.thinking) {
+        setChatThinking({
+          typeId: "question",
+          typeName: "Question Think",
+          level: 1,
+          levelName: "Think",
+          content: parsedFinal.thinking,
+        });
+      }
+      const cleanContent = parsedFinal.visibleContent;
+
       let tokensUsed = 0;
       try {
         const usageResponse = await apiRequest("POST", "/api/token-usage/apply", {
           sessionId,
           modelId: model?.id,
           inputChars: content.length,
-          outputChars: fullText.length,
+          outputChars: cleanContent.length,
           action: "chat",
         });
         const usageData = await usageResponse.json();
@@ -601,7 +617,7 @@ export default function ChatPage() {
 
       await apiRequest("POST", `/api/sessions/${sessionId}/messages`, {
         role: "assistant",
-        content: fullText,
+        content: cleanContent,
         modelId: selectedModel ? parseInt(selectedModel) : undefined,
         tokensUsed,
       });
@@ -615,6 +631,7 @@ export default function ChatPage() {
   const sendMessageStreaming = async (content: string) => {
     setIsStreaming(true);
     setStreamingContent("");
+    setChatThinking(null);
     setMessage("");
 
     // Optimistically add user message to cache so it appears immediately
@@ -680,8 +697,42 @@ export default function ChatPage() {
             try {
               const data = JSON.parse(line.slice(6));
               if (data.type === "chunk") {
-                setStreamingContent((prev) => prev + data.content);
+                setStreamingContent((prev) => {
+                  const accumulated = prev + data.content;
+                  // Parse streaming thinking — hide thinking tags from visible content
+                  const parsed = parseStreamingThinking(accumulated);
+                  if (parsed.thinking && !chatThinking) {
+                    setChatThinking({
+                      typeId: "question",
+                      typeName: "Question Think",
+                      level: 1,
+                      levelName: "Think",
+                      content: parsed.thinking,
+                    });
+                  }
+                  if (parsed.isInsideThinking) {
+                    return accumulated; // Keep raw content for continued parsing
+                  }
+                  return accumulated;
+                });
+              } else if (data.type === "thinking-data") {
+                // Server explicitly sends thinking content
+                setChatThinking(data.context);
               } else if (data.type === "done") {
+                // Final parse: extract any thinking from the completed response
+                setStreamingContent((prev) => {
+                  const parsed = parseStreamingThinking(prev);
+                  if (parsed.thinking && !chatThinking) {
+                    setChatThinking({
+                      typeId: "question",
+                      typeName: "Question Think",
+                      level: 1,
+                      levelName: "Think",
+                      content: parsed.thinking,
+                    });
+                  }
+                  return parsed.visibleContent;
+                });
                 queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "messages"] });
                 queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "files"] });
                 queryClient.invalidateQueries({ queryKey: ["/api/auth/user"] });
@@ -709,6 +760,7 @@ export default function ChatPage() {
     } finally {
       setIsStreaming(false);
       setStreamingContent("");
+      // Don't reset chatThinking here — it persists after streaming ends so the thinking block stays visible
       abortControllerRef.current = null;
     }
   };
@@ -1454,6 +1506,13 @@ export default function ChatPage() {
                   )
                 )}
 
+                {/* AI thinking blocks — collapsed by default */}
+                {buildState.thinkingBlocks.length > 0 && (
+                  buildState.thinkingBlocks.map((block, i) => (
+                    <ThinkingBlock key={`tb-${i}`} context={block} />
+                  ))
+                )}
+
                 {/* Build thinking indicator */}
                 {isBuildActive && buildState.thinkingMessage && (
                   <BuildThinkingIndicator message={buildState.thinkingMessage} />
@@ -1467,21 +1526,32 @@ export default function ChatPage() {
                   </div>
                 )}
 
-                {/* Streaming message for plan/question modes */}
-                {isStreaming && !isBuildActive && buildState.status === "idle" && (
-                  <div className="flex gap-3" data-testid="message-streaming">
-                    <div className="w-8 h-8 rounded-full bg-primary flex items-center justify-center shrink-0">
-                      <Bot className="w-4 h-4 text-primary-foreground animate-pulse" />
-                    </div>
-                    <div className="max-w-[85%] rounded-xl px-4 py-3 bg-card border border-card-border">
-                      {streamingContent ? (
-                        <MarkdownRenderer content={streamingContent} className="text-sm" />
-                      ) : (
-                        <p className="text-sm text-muted-foreground">Thinking...</p>
-                      )}
-                    </div>
-                  </div>
+                {/* Chat thinking block — shown above streaming response */}
+                {chatThinking && chatThinking.content && (
+                  <ThinkingBlock context={chatThinking as any} />
                 )}
+
+                {/* Streaming message for plan/question modes */}
+                {isStreaming && !isBuildActive && buildState.status === "idle" && (() => {
+                  const parsed = parseStreamingThinking(streamingContent);
+                  const visibleContent = parsed.visibleContent;
+                  return (
+                    <div className="flex gap-3" data-testid="message-streaming">
+                      <div className="w-8 h-8 rounded-full bg-primary flex items-center justify-center shrink-0">
+                        <Bot className="w-4 h-4 text-primary-foreground animate-pulse" />
+                      </div>
+                      <div className="max-w-[85%] rounded-xl px-4 py-3 bg-card border border-card-border">
+                        {visibleContent ? (
+                          <MarkdownRenderer content={visibleContent} className="text-sm" />
+                        ) : (
+                          <p className="text-sm text-muted-foreground">
+                            {parsed.isInsideThinking ? "Reasoning..." : "Thinking..."}
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })()}
                 <div ref={messagesEndRef} />
               </div>
             </ScrollArea>

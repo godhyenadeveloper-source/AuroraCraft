@@ -9,6 +9,7 @@ import {
   tokenUsage,
   siteSettings,
   builds,
+  memories,
   type User,
   type UpsertUser,
   type Provider,
@@ -166,6 +167,7 @@ export class DatabaseStorage implements IStorage {
   }
 
   async deleteUser(id: string): Promise<void> {
+    await db.delete(memories).where(eq(memories.ownerId, id));
     await db.delete(users).where(eq(users.id, id));
   }
 
@@ -271,6 +273,7 @@ export class DatabaseStorage implements IStorage {
   }
 
   async deleteSession(id: number): Promise<void> {
+    await db.delete(memories).where(eq(memories.projectId, id));
     await db.delete(tokenUsage).where(eq(tokenUsage.sessionId, id));
     await db.delete(builds).where(eq(builds.sessionId, id));
     await db.delete(chatMessages).where(eq(chatMessages.sessionId, id));

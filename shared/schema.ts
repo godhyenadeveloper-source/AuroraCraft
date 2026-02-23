@@ -160,10 +160,30 @@ export const siteSettings = pgTable("site_settings", {
   updatedAt: timestamp("updated_at").defaultNow(),
 });
 
+// Memories — 3-tier memory system (global, personal, project)
+export const memories = pgTable("memories", {
+  id: serial("id").primaryKey(),
+  scope: varchar("scope").notNull(),           // "global" | "personal" | "project"
+  ownerId: varchar("owner_id").references(() => users.id),
+  projectId: integer("project_id").references(() => chatSessions.id),
+  content: text("content").notNull(),
+  tags: jsonb("tags").$type<string[]>().default([]),
+  isInternal: boolean("is_internal").default(false),
+  createdAt: timestamp("created_at").defaultNow(),
+  updatedAt: timestamp("updated_at").defaultNow(),
+}, (table) => [
+  index("idx_memories_scope").on(table.scope),
+  index("idx_memories_owner").on(table.ownerId),
+  index("idx_memories_project").on(table.projectId),
+  index("idx_memories_scope_owner").on(table.scope, table.ownerId),
+  index("idx_memories_scope_project").on(table.scope, table.projectId),
+]);
+
 // Relations
 export const usersRelations = relations(users, ({ many }) => ({
   chatSessions: many(chatSessions),
   tokenUsage: many(tokenUsage),
+  memories: many(memories),
 }));
 
 export const providersRelations = relations(providers, ({ many }) => ({
@@ -186,6 +206,7 @@ export const chatSessionsRelations = relations(chatSessions, ({ one, many }) => 
   files: many(projectFiles),
   compilations: many(compilations),
   builds: many(builds),
+  memories: many(memories),
 }));
 
 export const buildsRelations = relations(builds, ({ one }) => ({
@@ -240,6 +261,17 @@ export const tokenUsageRelations = relations(tokenUsage, ({ one }) => ({
   model: one(models, {
     fields: [tokenUsage.modelId],
     references: [models.id],
+  }),
+}));
+
+export const memoriesRelations = relations(memories, ({ one }) => ({
+  owner: one(users, {
+    fields: [memories.ownerId],
+    references: [users.id],
+  }),
+  project: one(chatSessions, {
+    fields: [memories.projectId],
+    references: [chatSessions.id],
   }),
 }));
 
@@ -298,6 +330,12 @@ export const insertSiteSettingSchema = createInsertSchema(siteSettings).omit({
   updatedAt: true,
 });
 
+export const insertMemorySchema = createInsertSchema(memories).omit({
+  id: true,
+  createdAt: true,
+  updatedAt: true,
+});
+
 // Types
 export type UpsertUser = typeof users.$inferInsert;
 export type User = typeof users.$inferSelect;
@@ -329,3 +367,6 @@ export type InsertTokenUsage = z.infer<typeof insertTokenUsageSchema>;
 
 export type SiteSetting = typeof siteSettings.$inferSelect;
 export type InsertSiteSetting = z.infer<typeof insertSiteSettingSchema>;
+
+export type Memory = typeof memories.$inferSelect;
+export type InsertMemory = z.infer<typeof insertMemorySchema>;

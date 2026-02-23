@@ -1,10 +1,12 @@
 import type { ChatSession, ProjectFile, Compilation, ChatMessage } from "@shared/schema";
+import { buildThinkingInstruction } from "@shared/thinking-types";
 
 interface PromptContext {
   session: ChatSession;
   files: ProjectFile[];
   recentMessages: ChatMessage[];
   latestCompilation?: Compilation;
+  memoryContext?: string;
 }
 
 const MINECRAFT_FRAMEWORKS = {
@@ -66,11 +68,18 @@ function getRecentContextSummary(messages: ChatMessage[]): string {
   return `Recent user requests:\n${recentUserMessages.map(m => `- "${m.content.slice(0, 100)}${m.content.length > 100 ? '...' : ''}"`).join("\n")}`;
 }
 
-export function buildSystemPrompt(mode: string, context?: PromptContext): string {
+export function buildSystemPrompt(
+  mode: string,
+  context?: PromptContext,
+  thinkingCtx?: { typeId: string; level: number },
+): string {
   const framework = context?.session?.framework || "paper";
   const frameworkDescription = MINECRAFT_FRAMEWORKS[framework as keyof typeof MINECRAFT_FRAMEWORKS] || framework;
-  
-  const basePrompt = `You are AuroraCraft, an advanced agentic AI system specialized in creating production-ready Minecraft server plugins.
+  const thinkingBlock = thinkingCtx
+    ? buildThinkingInstruction(thinkingCtx.typeId, thinkingCtx.level)
+    : "";
+
+  const basePrompt = `${thinkingBlock}You are AuroraCraft, an advanced agentic AI system specialized in creating production-ready Minecraft server plugins.
 
 ## Your Core Identity
 You are an expert Java developer with deep knowledge of:
@@ -116,6 +125,7 @@ You are an expert Java developer with deep knowledge of:
   const fileSummary = context ? getProjectFileSummary(context.files) : "";
   const compilationStatus = context ? getCompilationStatus(context.latestCompilation) : "";
   const recentContext = context ? getRecentContextSummary(context.recentMessages) : "";
+  const memorySection = context?.memoryContext || "";
 
   const projectContext = context ? `
 
@@ -127,7 +137,9 @@ ${fileSummary}
 
 ${compilationStatus}
 
-${recentContext}` : "";
+${recentContext}
+
+${memorySection}` : "";
 
   switch (mode) {
     case "plan":

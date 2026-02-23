@@ -5,6 +5,8 @@
  * Shared between client-side and server-side build engines.
  */
 
+import { buildThinkingInstruction } from "./thinking-types";
+
 const FRAMEWORK_INFO: Record<string, string> = {
   paper: "Paper API (modern fork with async events, Adventure components for text)",
   bukkit: "Bukkit API (legacy, widely compatible)",
@@ -24,8 +26,13 @@ export function buildPlanningPrompt(
   userRequest: string,
   framework: string,
   existingFiles?: { path: string; content: string }[],
+  thinkingCtx?: { typeId: string; level: number },
+  memoryContext?: string,
 ): string {
   const frameworkDesc = FRAMEWORK_INFO[framework] || framework;
+  const thinkingBlock = thinkingCtx
+    ? buildThinkingInstruction(thinkingCtx.typeId, thinkingCtx.level)
+    : "";
   let existingContext = "";
   if (existingFiles?.length) {
     existingContext = `\n## EXISTING PROJECT FILES (your memory of the project)\nThe project already has ${existingFiles.length} files. You MUST use this knowledge to make accurate changes — never ask the user for information that is already in these files.\n`;
@@ -34,7 +41,7 @@ export function buildPlanningPrompt(
     }
   }
 
-  return `You are AuroraCraft, an expert Minecraft plugin architect specializing in Java 21 and ${frameworkDesc}.
+  return `${thinkingBlock}You are AuroraCraft, an expert Minecraft plugin architect specializing in Java 21 and ${frameworkDesc}.
 
 Your task is to analyze the user's request and create a structured build plan.
 
@@ -52,8 +59,7 @@ Your task is to analyze the user's request and create a structured build plan.
 - Order files within each phase so dependencies come first (e.g., main class before commands)
 - Do NOT include file reading steps in the plan. The build engine reads files automatically when needed. Only list files that need to be created or modified.
 - For quick-change requests, the engine handles file reading and context gathering automatically.
-${existingContext}
-
+${existingContext}${memoryContext ? `\n## MEMORY CONTEXT (knowledge from previous work)\n${memoryContext}\n` : ""}
 ## RESPONSE FORMAT
 Choose ONE of three response types based on the request complexity:
 
@@ -122,16 +128,21 @@ export function buildFileGenerationPrompt(
   projectContext: string,
   framework: string,
   packageName: string,
+  thinkingCtx?: { typeId: string; level: number },
+  memoryContext?: string,
 ): string {
   const frameworkDesc = FRAMEWORK_INFO[framework] || framework;
+  const thinkingBlock = thinkingCtx
+    ? buildThinkingInstruction(thinkingCtx.typeId, thinkingCtx.level)
+    : "";
 
-  return `You are AuroraCraft, an expert Java 21 developer specializing in ${frameworkDesc} plugins.
+  return `${thinkingBlock}You are AuroraCraft, an expert Java 21 developer specializing in ${frameworkDesc} plugins.
 
 Generate the COMPLETE content of: \`${filePath}\`
 Purpose: ${fileDescription} | Phase: ${phaseName} | Package: ${packageName}
 
 ${projectContext}
-
+${memoryContext ? `\n## MEMORY CONTEXT\n${memoryContext}\n` : ""}
 RULES: Output ONLY raw file content. No markdown fences, no commentary, no preamble. File must be COMPLETE with no placeholders or TODOs. All imports must be correct. Use Java 21 features where appropriate.
 
 Generate \`${filePath}\`:`;
@@ -147,16 +158,21 @@ export function buildPatchPrompt(
   fixReason: string,
   framework: string,
   packageName: string,
+  thinkingCtx?: { typeId: string; level: number },
+  memoryContext?: string,
 ): string {
   const frameworkDesc = FRAMEWORK_INFO[framework] || framework;
+  const thinkingBlock = thinkingCtx
+    ? buildThinkingInstruction(thinkingCtx.typeId, thinkingCtx.level)
+    : "";
 
-  return `You are AuroraCraft, a ${frameworkDesc} expert. Apply a targeted fix to \`${filePath}\` (package: ${packageName}).
+  return `${thinkingBlock}You are AuroraCraft, a ${frameworkDesc} expert. Apply a targeted fix to \`${filePath}\` (package: ${packageName}).
 
 FIX REQUIRED: ${fixReason}
 
 CURRENT FILE:
 ${currentContent}
-
+${memoryContext ? `\n## MEMORY CONTEXT\n${memoryContext}\n` : ""}
 RULES: Output ONLY the complete corrected file content. Change ONLY what is necessary to fix the issue. Preserve all other code exactly. No markdown fences, no commentary.
 
 Output the corrected \`${filePath}\`:`;
@@ -170,8 +186,13 @@ export function buildReviewPrompt(
   phaseFiles: { path: string; content: string }[],
   framework: string,
   allProjectFiles?: { path: string; content: string }[],
+  thinkingCtx?: { typeId: string; level: number },
+  memoryContext?: string,
 ): string {
   const frameworkDesc = FRAMEWORK_INFO[framework] || framework;
+  const thinkingBlock = thinkingCtx
+    ? buildThinkingInstruction(thinkingCtx.typeId, thinkingCtx.level)
+    : "";
 
   const fileContents = phaseFiles
     .map((f) => `=== FILE: ${f.path} ===\n${f.content}\n=== END FILE ===`)
@@ -188,12 +209,12 @@ export function buildReviewPrompt(
     }
   }
 
-  return `You are AuroraCraft, a Java code reviewer for ${frameworkDesc} plugins.
+  return `${thinkingBlock}You are AuroraCraft, a Java code reviewer for ${frameworkDesc} plugins.
 
 Review these files for: missing/incorrect imports, wrong package declarations, missing method implementations, inconsistent naming between files, missing plugin.yml entries, incorrect pom.xml dependencies.
 
 ${fileContents}${crossPhaseContext}
-
+${memoryContext ? `\n## MEMORY CONTEXT\n${memoryContext}\n` : ""}
 If a fix requires changing a file from a previous phase, include it in the fixes array with its full path. You may fix any file in the project, not just files from the current phase.
 
 Return ONLY JSON. If correct: { "passed": true }
@@ -210,16 +231,21 @@ export function buildSummaryPrompt(
   pluginDescription: string,
   phases: { name: string; files: { path: string; name: string }[] }[],
   framework: string,
+  thinkingCtx?: { typeId: string; level: number },
+  memoryContext?: string,
 ): string {
+  const thinkingBlock = thinkingCtx
+    ? buildThinkingInstruction(thinkingCtx.typeId, thinkingCtx.level)
+    : "";
   const totalFiles = phases.reduce((sum, p) => sum + p.files.length, 0);
   const fileList = phases
     .flatMap((p) => p.files.map((f) => `- \`${f.path}\``))
     .join("\n");
 
-  return `Build complete: **${pluginName}** (${framework}) — ${pluginDescription}
+  return `${thinkingBlock}Build complete: **${pluginName}** (${framework}) — ${pluginDescription}
 ${totalFiles} files created:
 ${fileList}
-
+${memoryContext ? `\n## MEMORY CONTEXT\n${memoryContext}\n` : ""}
 Write a concise markdown build summary. Include: what was built, key features, commands & permissions (if any), how to compile (\`mvn clean package\`), and where to find the JAR. Use headings, bold, code blocks, bullet lists.`;
 }
 
@@ -232,17 +258,22 @@ export function buildFileReadPrompt(
   content: string,
   userRequest: string,
   framework: string,
+  thinkingCtx?: { typeId: string; level: number },
+  memoryContext?: string,
 ): string {
   const frameworkDesc = FRAMEWORK_INFO[framework] || framework;
+  const thinkingBlock = thinkingCtx
+    ? buildThinkingInstruction(thinkingCtx.typeId, thinkingCtx.level)
+    : "";
 
-  return `You are AuroraCraft, a ${frameworkDesc} code analyst. Analyze this file deeply to understand its structure and purpose.
+  return `${thinkingBlock}You are AuroraCraft, a ${frameworkDesc} code analyst. Analyze this file deeply to understand its structure and purpose.
 
 FILE: \`${filePath}\`
 CONTENT:
 ${content}
 
 USER'S CURRENT REQUEST: ${userRequest}
-
+${memoryContext ? `\n## MEMORY CONTEXT\n${memoryContext}\n` : ""}
 Provide a concise structured analysis as JSON:
 {
   "purpose": "one-line description of what this file does",
@@ -265,6 +296,8 @@ export function buildAgenticStepPrompt(
   fileTree: string[],
   fileSummaries: { path: string; summary: string }[],
   previousActions: { action: string; path: string; reason: string }[],
+  thinkingCtx?: { typeId: string; level: number },
+  memoryContext?: string,
 ): string {
   const summaryContext = fileSummaries.length > 0
     ? `\n## FILE KNOWLEDGE (summaries from previous reads)\n${fileSummaries.map((f) => `- \`${f.path}\`: ${f.summary}`).join("\n")}`
@@ -274,14 +307,18 @@ export function buildAgenticStepPrompt(
     ? `\n## ACTIONS TAKEN SO FAR\n${previousActions.map((a, i) => `${i + 1}. ${a.action} \`${a.path}\` — ${a.reason}`).join("\n")}`
     : "";
 
-  return `You are AuroraCraft, an expert Minecraft plugin developer executing a quick change.
+  const thinkingBlock = thinkingCtx
+    ? buildThinkingInstruction(thinkingCtx.typeId, thinkingCtx.level)
+    : "";
+
+  return `${thinkingBlock}You are AuroraCraft, an expert Minecraft plugin developer executing a quick change.
 
 ## USER REQUEST
 ${userRequest}
 
 ## PROJECT FILES
 ${fileTree.map((f) => `- ${f}`).join("\n")}
-${summaryContext}${actionsLog}
+${summaryContext}${actionsLog}${memoryContext ? `\n\n## MEMORY CONTEXT\n${memoryContext}` : ""}
 
 ## YOUR TASK
 Decide the NEXT single action to take. You have these options:

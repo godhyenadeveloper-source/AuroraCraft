@@ -20,6 +20,12 @@ import {
   buildFileReadPrompt,
   buildAgenticStepPrompt,
 } from "@shared/build-prompts";
+import {
+  classifyThinkingType,
+  resolveThinkingContext,
+  type ThinkingContext,
+} from "@shared/thinking-types";
+import { parseThinking } from "@shared/thinking-parser";
 
 // ─── Types ───────────────────────────────────────────────────────────────
 
@@ -73,6 +79,7 @@ export interface BuildState {
   plan: BuildPlan | null;
   phases: PhaseState[];
   thinkingMessage: string | null;
+  thinkingBlocks: ThinkingContext[];
   summary: string | null;
   error: string | null;
 }
@@ -99,6 +106,7 @@ export type BuildEvent =
   | { type: "build-complete"; summary: string }
   | { type: "build-error"; error: string }
   | { type: "thinking"; message: string }
+  | { type: "thinking-block"; context: ThinkingContext }
   | { type: "snapshot"; state: any };
 
 export const INITIAL_BUILD_STATE: BuildState = {
@@ -106,6 +114,7 @@ export const INITIAL_BUILD_STATE: BuildState = {
   plan: null,
   phases: [],
   thinkingMessage: null,
+  thinkingBlocks: [],
   summary: null,
   error: null,
 };
@@ -141,7 +150,7 @@ export function buildReducer(state: BuildState, event: BuildEvent): BuildState {
       return { ...state, status: "building" };
 
     case "conversation-response":
-      return { ...INITIAL_BUILD_STATE };
+      return { ...INITIAL_BUILD_STATE, thinkingBlocks: state.thinkingBlocks };
 
     case "quick-change-start":
       return {
@@ -277,6 +286,9 @@ export function buildReducer(state: BuildState, event: BuildEvent): BuildState {
     case "thinking":
       return { ...state, thinkingMessage: event.message };
 
+    case "thinking-block":
+      return { ...state, thinkingBlocks: [...state.thinkingBlocks, event.context] };
+
     case "snapshot": {
       const s = event.state;
       return {
@@ -284,6 +296,7 @@ export function buildReducer(state: BuildState, event: BuildEvent): BuildState {
         plan: s.plan || null,
         phases: s.phases || [],
         thinkingMessage: s.thinkingMessage || null,
+        thinkingBlocks: s.thinkingBlocks || [],
         summary: s.summary || null,
         error: s.error || null,
       };
@@ -523,11 +536,45 @@ export async function runBuild(params: RunBuildParams): Promise<void> {
         fileIdMap.set(ef.path, ef.id);
       }
     } catch {}
-    const planningPrompt = buildPlanningPrompt(userRequest, framework, existingFilesForPlanning.length > 0 ? existingFilesForPlanning : undefined);
+
+    // Fetch memory context from server
+    let memoryCtx = "";
+    const fetchMemoryContext = async (): Promise<void> => {
+      try {
+        const res = await apiRequest("GET", `/api/sessions/${sessionId}/memory-context`);
+        const data = await res.json();
+        memoryCtx = data.context || "";
+      } catch {}
+    };
+    const writeProjectMemory = async (content: string, tags: string[]): Promise<void> => {
+      try { await apiRequest("POST", `/api/sessions/${sessionId}/memories`, { content, tags }); } catch {}
+    };
+    const updateFileStructureMap = async (entries: { path: string; description: string }[]): Promise<void> => {
+      try { await apiRequest("POST", `/api/sessions/${sessionId}/file-structure-map`, { fileEntries: entries }); } catch {}
+    };
+    const getFileEntries = (): { path: string; description: string }[] => {
+      return Array.from(fileMemory.keys()).map(path => ({
+        path,
+        description: "Project file",
+      }));
+    };
+    await fetchMemoryContext();
+
+    const planThinking = classifyThinkingType("planning", { userRequest });
+    const planningPrompt = buildPlanningPrompt(
+      userRequest, framework,
+      existingFilesForPlanning.length > 0 ? existingFilesForPlanning : undefined,
+      planThinking,
+      memoryCtx,
+    );
     const planningInput = params.resumeContext
       ? `${userRequest}\n\nCONTEXT FROM PREVIOUS BUILD:\n${params.resumeContext}`
       : userRequest;
-    const planRaw = await callAI(planningPrompt, planningInput);
+    const planRawFull = await callAI(planningPrompt, planningInput);
+    const { thinking: planThinkingContent, output: planRaw } = parseThinking(planRawFull);
+    if (planThinkingContent) {
+      onEvent({ type: "thinking-block", context: { ...resolveThinkingContext(planThinking.typeId, planThinking.level), content: planThinkingContent } });
+    }
 
     // Parse the JSON plan (strip markdown fences if AI wrapped them)
     const planJson = parseAIPlanJSON(planRaw);
@@ -559,11 +606,16 @@ export async function runBuild(params: RunBuildParams): Promise<void> {
         if (signal.aborted) throw new Error("Build cancelled");
 
         onEvent({ type: "thinking", message: "Deciding next action..." });
-        const stepPrompt = buildAgenticStepPrompt(userRequest, fileTree, fileSummaries, actionsLog);
-        const stepRaw = await callAI(stepPrompt, "Decide the next action.");
+        const stepThinking = classifyThinkingType("agentic-step", { affectedFileCount: actionsLog.length, userRequest });
+        const stepPrompt = buildAgenticStepPrompt(userRequest, fileTree, fileSummaries, actionsLog, stepThinking, memoryCtx);
+        const stepRawFull = await callAI(stepPrompt, "Decide the next action.");
+        const { thinking: stepThinkContent, output: stepRawClean } = parseThinking(stepRawFull);
+        if (stepThinkContent) {
+          onEvent({ type: "thinking-block", context: { ...resolveThinkingContext(stepThinking.typeId, stepThinking.level), content: stepThinkContent } });
+        }
         let stepJson: any;
         try {
-          stepJson = parseAIPlanJSON(stepRaw);
+          stepJson = parseAIPlanJSON(stepRawClean);
         } catch {
           break; // Can't parse — treat as done
         }
@@ -607,8 +659,13 @@ export async function runBuild(params: RunBuildParams): Promise<void> {
           const content = fileMemory.get(actionPath);
           if (content) {
             // Analyze with AI for summary
-            const readPrompt = buildFileReadPrompt(actionPath, content, userRequest, framework);
-            const analysisRaw = await callAI(readPrompt, `Analyze ${actionPath}`);
+            const readThinking = classifyThinkingType("file-read", { fileCount: 1 });
+            const readPrompt = buildFileReadPrompt(actionPath, content, userRequest, framework, readThinking, memoryCtx);
+            const analysisRawFull = await callAI(readPrompt, `Analyze ${actionPath}`);
+            const { thinking: readThinkContent, output: analysisRaw } = parseThinking(analysisRawFull);
+            if (readThinkContent) {
+              onEvent({ type: "thinking-block", context: { ...resolveThinkingContext(readThinking.typeId, readThinking.level), content: readThinkContent } });
+            }
             let summaryText: string;
             try {
               const analysis = JSON.parse(analysisRaw.replace(/^```(?:json)?\s*\n?/m, "").replace(/\n?```\s*$/m, "").trim());
@@ -624,12 +681,18 @@ export async function runBuild(params: RunBuildParams): Promise<void> {
           const existingContent = fileMemory.get(actionPath);
           const existingId = fileIdMap.get(actionPath);
           if (existingContent && existingId) {
+            const patchThinking = classifyThinkingType("file-patch", { affectedFileCount: 1, filePath: actionPath });
             const patchPrompt = buildPatchPrompt(
               actionPath, existingContent,
               `${userRequest} — specifically: ${actionReason}`,
               framework, "com.example.plugin",
+              patchThinking, memoryCtx,
             );
-            const updatedContent = await callAI(patchPrompt, `Apply this change: ${actionReason}`);
+            const patchRawFull = await callAI(patchPrompt, `Apply this change: ${actionReason}`);
+            const { thinking: patchThinkContent, output: updatedContent } = parseThinking(patchRawFull);
+            if (patchThinkContent) {
+              onEvent({ type: "thinking-block", context: { ...resolveThinkingContext(patchThinking.typeId, patchThinking.level), content: patchThinkContent } });
+            }
             await apiRequest("PATCH", `/api/files/${existingId}`, { content: updatedContent });
             fileMemory.set(actionPath, updatedContent);
             onEvent({ type: "file-updated", phaseIndex, fileIndex: fileIdx, path: actionPath });
@@ -639,11 +702,17 @@ export async function runBuild(params: RunBuildParams): Promise<void> {
         } else if (action === "create") {
           onEvent({ type: "file-generating", phaseIndex, fileIndex: fileIdx });
           const projectContext = buildProjectContext();
+          const createThinking = classifyThinkingType("file-generation", { filePath: actionPath });
           const genPrompt = buildFileGenerationPrompt(
             actionPath, fileName, actionReason,
             "Quick Change", projectContext, framework, "com.example.plugin",
+            createThinking, memoryCtx,
           );
-          const content = await callAI(genPrompt, `Generate ${actionPath}`);
+          const createRawFull = await callAI(genPrompt, `Generate ${actionPath}`);
+          const { thinking: createThinkContent, output: content } = parseThinking(createRawFull);
+          if (createThinkContent) {
+            onEvent({ type: "thinking-block", context: { ...resolveThinkingContext(createThinking.typeId, createThinking.level), content: createThinkContent } });
+          }
           const createRes = await apiRequest("POST", `/api/sessions/${sessionId}/files`, {
             path: actionPath, name: fileName, content,
           });
@@ -741,14 +810,20 @@ export async function runBuild(params: RunBuildParams): Promise<void> {
         }
         if (result.action === 'edit' && result.editInstructions) {
           onEvent({ type: "thinking", message: "Revising plan..." });
-          const revisedPlanText = await callAI(
+          const reviseThinking = classifyThinkingType("planning", { userRequest: userRequest + result.editInstructions });
+          const revisedPlanRawFull = await callAI(
             buildPlanningPrompt(
               `${userRequest}\n\nIMPORTANT MODIFICATIONS: ${result.editInstructions}`,
               framework,
               existingFilesForPlanning.length > 0 ? existingFilesForPlanning : undefined,
+              reviseThinking,
             ),
             "Revise the build plan with these modifications.",
           );
+          const { thinking: reviseThinkContent, output: revisedPlanText } = parseThinking(revisedPlanRawFull);
+          if (reviseThinkContent) {
+            onEvent({ type: "thinking-block", context: { ...resolveThinkingContext(reviseThinking.typeId, reviseThinking.level), content: reviseThinkContent } });
+          }
           const revisedParsed = parseAIPlanJSON(revisedPlanText);
           if (revisedParsed?.type === "build" || revisedParsed?.phases) {
             currentPlan = {
@@ -785,6 +860,9 @@ export async function runBuild(params: RunBuildParams): Promise<void> {
 
     for (let phaseIdx = 0; phaseIdx < plan.phases.length; phaseIdx++) {
       if (signal.aborted) throw new Error("Build cancelled");
+
+      // Refresh memory context at each phase boundary
+      await fetchMemoryContext();
 
       const phase = plan.phases[phaseIdx];
       onEvent({ type: "phase-start", phaseIndex: phaseIdx });
@@ -835,8 +913,13 @@ No text before or after the JSON.`;
             onEvent({ type: "file-reading", phaseIndex: phaseIdx, fileIndex: readIdx });
 
             // AI analysis for context enrichment
-            const readPrompt = buildFileReadPrompt(readPath, content, userRequest, framework);
-            await callAI(readPrompt, `Analyze ${readPath}`);
+            const phaseReadThinking = classifyThinkingType("file-read", { fileCount: 1 });
+            const readPrompt = buildFileReadPrompt(readPath, content, userRequest, framework, phaseReadThinking, memoryCtx);
+            const readRawFull = await callAI(readPrompt, `Analyze ${readPath}`);
+            const { thinking: phaseReadThinkContent } = parseThinking(readRawFull);
+            if (phaseReadThinkContent) {
+              onEvent({ type: "thinking-block", context: { ...resolveThinkingContext(phaseReadThinking.typeId, phaseReadThinking.level), content: phaseReadThinkContent } });
+            }
 
             onEvent({ type: "file-read", phaseIndex: phaseIdx, fileIndex: readIdx, path: readPath });
           }
@@ -858,6 +941,7 @@ No text before or after the JSON.`;
 
         try {
           const currentPhasePaths = phase.files.slice(0, fileIdx).map(f => f.path);
+          const fileGenThinking = classifyThinkingType("file-generation", { filePath: file.path });
           const filePrompt = buildFileGenerationPrompt(
             file.path,
             file.name,
@@ -866,13 +950,23 @@ No text before or after the JSON.`;
             buildProjectContext(currentPhasePaths),
             framework,
             plan.packageName,
+            fileGenThinking,
+            memoryCtx,
           );
 
-          const fileContent = await callAI(filePrompt, `Generate ${file.path}`);
+          const fileRawFull = await callAI(filePrompt, `Generate ${file.path}`);
+          const { thinking: fileThinkContent, output: fileContent } = parseThinking(fileRawFull);
+          if (fileThinkContent) {
+            onEvent({ type: "thinking-block", context: { ...resolveThinkingContext(fileGenThinking.typeId, fileGenThinking.level), content: fileThinkContent } });
+          }
           await writeFile(file.path, file.name, fileContent);
           reportTokenUsage(filePrompt.length, fileContent.length);
 
           onEvent({ type: "file-created", phaseIndex: phaseIdx, fileIndex: fileIdx, path: file.path });
+
+          // Update file structure map in project memory
+          updateFileStructureMap(getFileEntries());
+
           fileIdx++;
         } catch (e: any) {
           if (e.message === "Build cancelled") throw e;
@@ -908,8 +1002,13 @@ No text before or after the JSON.`;
         const allProjectFiles = Array.from(fileMemory.entries()).map(([path, content]) => ({ path, content }));
 
         if (phaseFiles.length > 0) {
-          const reviewPrompt = buildReviewPrompt(phaseFiles, framework, allProjectFiles);
-          const reviewRaw = await callAI(reviewPrompt, "Review these files.");
+          const reviewThinking = classifyThinkingType("review", { fileCount: allProjectFiles.length });
+          const reviewPrompt = buildReviewPrompt(phaseFiles, framework, allProjectFiles, reviewThinking, memoryCtx);
+          const reviewRawFull = await callAI(reviewPrompt, "Review these files.");
+          const { thinking: reviewThinkContent, output: reviewRaw } = parseThinking(reviewRawFull);
+          if (reviewThinkContent) {
+            onEvent({ type: "thinking-block", context: { ...resolveThinkingContext(reviewThinking.typeId, reviewThinking.level), content: reviewThinkContent } });
+          }
 
           let reviewResult: any;
           try {
@@ -959,6 +1058,7 @@ No text before or after the JSON.`;
 
               try {
                 const existingContent = fileMemory.get(fixFile.path);
+                const fixThinking = classifyThinkingType("error-fix", { fixCount: reviewResult.fixes.length, filePath: fixFile.path });
                 let fixPrompt: string;
                 if (existingContent) {
                   fixPrompt = buildPatchPrompt(
@@ -967,6 +1067,8 @@ No text before or after the JSON.`;
                     fix.reason,
                     framework,
                     plan.packageName,
+                    fixThinking,
+                    memoryCtx,
                   );
                 } else {
                   fixPrompt = buildFileGenerationPrompt(
@@ -977,14 +1079,26 @@ No text before or after the JSON.`;
                     buildProjectContext(),
                     framework,
                     plan.packageName,
+                    fixThinking,
+                    memoryCtx,
                   );
                 }
 
-                const fixedContent = await callAI(fixPrompt, `Fix ${fixFile.path}: ${fix.reason}`);
+                const fixRawFull = await callAI(fixPrompt, `Fix ${fixFile.path}: ${fix.reason}`);
+                const { thinking: fixThinkContent, output: fixedContent } = parseThinking(fixRawFull);
+                if (fixThinkContent) {
+                  onEvent({ type: "thinking-block", context: { ...resolveThinkingContext(fixThinking.typeId, fixThinking.level), content: fixThinkContent } });
+                }
                 await writeFile(fixFile.path, fixFile.name, fixedContent);
                 reportTokenUsage(fixPrompt.length, fixedContent.length);
 
                 onEvent({ type: "file-updated", phaseIndex: fixPhaseIdx, fileIndex: fixFileIdx, path: fixFile.path });
+
+                // Write error fix to project memory
+                writeProjectMemory(`Fixed error in ${fixFile.path}: ${fix.reason}`, ["error-fix", fixFile.path]);
+
+                // Update file structure map
+                updateFileStructureMap(getFileEntries());
               } catch (e: any) {
                 if (e.message === "Build cancelled") throw e;
                 onEvent({
@@ -1004,20 +1118,35 @@ No text before or after the JSON.`;
       }
 
       onEvent({ type: "phase-complete", phaseIndex: phaseIdx });
+
+      // Write phase completion to project memory
+      const completedPhase = plan.phases[phaseIdx];
+      const createdFiles = completedPhase.files.map(f => f.path).join(", ");
+      writeProjectMemory(
+        `Phase "${completedPhase.name}" completed: ${completedPhase.description}. Files: ${createdFiles}`,
+        ["phase-summary", completedPhase.name],
+      );
     }
 
     // 4. Final summary
     if (signal.aborted) throw new Error("Build cancelled");
     onEvent({ type: "thinking", message: "Generating build summary..." });
 
+    const summaryThinking = classifyThinkingType("summary", { phaseCount: plan.phases.length });
     const summaryPrompt = buildSummaryPrompt(
       plan.pluginName,
       plan.description,
       plan.phases,
       framework,
+      summaryThinking,
+      memoryCtx,
     );
 
-    const summary = await callAI(summaryPrompt, "Generate the build completion summary.");
+    const summaryRawFull = await callAI(summaryPrompt, "Generate the build completion summary.");
+    const { thinking: summaryThinkContent, output: summary } = parseThinking(summaryRawFull);
+    if (summaryThinkContent) {
+      onEvent({ type: "thinking-block", context: { ...resolveThinkingContext(summaryThinking.typeId, summaryThinking.level), content: summaryThinkContent } });
+    }
 
     // Save summary as assistant message
     await apiRequest("POST", `/api/sessions/${sessionId}/messages`, {
@@ -1027,6 +1156,12 @@ No text before or after the JSON.`;
     });
 
     onEvent({ type: "build-complete", summary });
+
+    // Write build summary to project memory
+    writeProjectMemory(
+      `Built plugin "${plan.pluginName}": ${plan.description}. Phases: ${plan.phases.map(p => p.name).join(", ")}`,
+      ["architecture", "build-summary"],
+    );
 
     // Update server build status
     try {
@@ -1227,12 +1362,18 @@ export async function resumeBuild(params: ResumeBuildParams): Promise<void> {
 
         try {
           const currentPhasePaths = phase.files.slice(0, fileIdx).map(f => f.path);
+          const resumeFileThinking = classifyThinkingType("file-generation", { filePath: file.path });
           const filePrompt = buildFileGenerationPrompt(
             file.path, file.name, file.description, phase.name,
             buildProjectContext(currentPhasePaths), framework, plan.packageName,
+            resumeFileThinking,
           );
 
-          const fileContent = await callAI(filePrompt, `Generate ${file.path}`);
+          const fileRawFull = await callAI(filePrompt, `Generate ${file.path}`);
+          const { thinking: resumeFileThinkContent, output: fileContent } = parseThinking(fileRawFull);
+          if (resumeFileThinkContent) {
+            onEvent({ type: "thinking-block", context: { ...resolveThinkingContext(resumeFileThinking.typeId, resumeFileThinking.level), content: resumeFileThinkContent } });
+          }
           await writeFile(file.path, file.name, fileContent);
           reportTokenUsage(filePrompt.length, fileContent.length);
 
@@ -1264,8 +1405,13 @@ export async function resumeBuild(params: ResumeBuildParams): Promise<void> {
         const allProjectFiles = Array.from(fileMemory.entries()).map(([path, content]) => ({ path, content }));
 
         if (phaseFiles.length > 0) {
-          const reviewPrompt = buildReviewPrompt(phaseFiles, framework, allProjectFiles);
-          const reviewRaw = await callAI(reviewPrompt, "Review these files.");
+          const resumeReviewThinking = classifyThinkingType("review", { fileCount: allProjectFiles.length });
+          const reviewPrompt = buildReviewPrompt(phaseFiles, framework, allProjectFiles, resumeReviewThinking);
+          const reviewRawFull = await callAI(reviewPrompt, "Review these files.");
+          const { thinking: resumeReviewThinkContent, output: reviewRaw } = parseThinking(reviewRawFull);
+          if (resumeReviewThinkContent) {
+            onEvent({ type: "thinking-block", context: { ...resolveThinkingContext(resumeReviewThinking.typeId, resumeReviewThinking.level), content: resumeReviewThinkContent } });
+          }
 
           let reviewResult: any;
           try {
@@ -1305,16 +1451,22 @@ export async function resumeBuild(params: ResumeBuildParams): Promise<void> {
 
               try {
                 const existingContent = fileMemory.get(fixFile.path);
+                const resumeFixThinking = classifyThinkingType("error-fix", { fixCount: reviewResult.fixes.length, filePath: fixFile.path });
                 let fixPrompt: string;
                 if (existingContent) {
-                  fixPrompt = buildPatchPrompt(fixFile.path, existingContent, fix.reason, framework, plan.packageName);
+                  fixPrompt = buildPatchPrompt(fixFile.path, existingContent, fix.reason, framework, plan.packageName, resumeFixThinking);
                 } else {
                   fixPrompt = buildFileGenerationPrompt(
                     fixFile.path, fixFile.name, `${fixFile.description}. FIX REQUIRED: ${fix.reason}`,
                     phase.name, buildProjectContext(), framework, plan.packageName,
+                    resumeFixThinking,
                   );
                 }
-                const fixedContent = await callAI(fixPrompt, `Fix ${fixFile.path}: ${fix.reason}`);
+                const fixRawFull = await callAI(fixPrompt, `Fix ${fixFile.path}: ${fix.reason}`);
+                const { thinking: resumeFixThinkContent, output: fixedContent } = parseThinking(fixRawFull);
+                if (resumeFixThinkContent) {
+                  onEvent({ type: "thinking-block", context: { ...resolveThinkingContext(resumeFixThinking.typeId, resumeFixThinking.level), content: resumeFixThinkContent } });
+                }
                 await writeFile(fixFile.path, fixFile.name, fixedContent);
                 reportTokenUsage(fixPrompt.length, fixedContent.length);
                 onEvent({ type: "file-updated", phaseIndex: fixPhaseIdx, fileIndex: fixFileIdx, path: fixFile.path });

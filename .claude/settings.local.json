@@ -19,7 +19,13 @@
       "Bash(npx drizzle-kit push 2>&1)",
       "Bash(pkill -f \"tsx server/index.ts\" 2>/dev/null; sleep 2; echo \"killed\")",
       "Bash(npm run build 2>&1 | tail -30)",
-      "Bash(npm run build 2>&1 | tail -15)"
+      "Bash(npm run build 2>&1 | tail -15)",
+      "Bash(grep '\"type\":\"assistant\"' /root/.claude/projects/-workspaces-AuroraCraft/87caeca1-62fa-41c4-a01b-a6c4980dc182/tool-results/b98ac33.txt | tail -1 | python3 -c \"\nimport sys, json\nline = sys.stdin.read\\(\\).strip\\(\\)\ndata = json.loads\\(line\\)\nfor block in data.get\\('message', {}\\).get\\('content', []\\):\n    if block.get\\('type'\\) == 'text':\n        print\\(block['text']\\)\n\" 2>/dev/null | head -500)",
+      "Bash(grep '\"type\":\"assistant\"' /root/.claude/projects/-workspaces-AuroraCraft/87caeca1-62fa-41c4-a01b-a6c4980dc182/tool-results/b98ac33.txt | python3 -c \"\nimport sys, json\nlines = sys.stdin.read\\(\\).strip\\(\\).split\\('\\\\n'\\)\nfor line in lines:\n    data = json.loads\\(line\\)\n    for block in data.get\\('message', {}\\).get\\('content', []\\):\n        if block.get\\('type'\\) == 'text' and len\\(block.get\\('text', ''\\)\\) > 200:\n            print\\(block['text'][:8000]\\)\n            print\\('---END BLOCK---'\\)\n\" 2>/dev/null)",
+      "Bash(npx tsc --noEmit 2>&1; echo \"EXIT_CODE: $?\")",
+      "Bash(npm run db:push 2>&1)",
+      "Bash(npx tsc --noEmit 2>&1; echo \"EXIT: $?\")",
+      "Bash(npx tsc --noEmit 2>&1; echo \"Exit code: $?\")"
     ]
   }
 }
