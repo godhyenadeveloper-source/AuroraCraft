@@ -42,7 +42,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { apiRequest, queryClient } from "@/lib/queryClient";
-import type { User, Provider, Model, SiteSetting } from "@shared/schema";
+import type { User, Provider, Model, SiteSetting, ProviderKey } from "@shared/schema";
 import {
   ArrowLeft,
   Blocks,
@@ -61,6 +61,9 @@ import {
   X,
   Loader2,
   BarChart3,
+  KeyRound,
+  Eye,
+  EyeOff,
 } from "lucide-react";
 
 type AdminTab = "overview" | "users" | "providers" | "models" | "analytics";
@@ -354,16 +357,185 @@ function UsersSection() {
   );
 }
 
+// Key Pool Manager — shown inside the "Manage Keys" dialog for a provider
+function KeyPoolManager({ provider }: { provider: Provider }) {
+  const { toast } = useToast();
+  const [newKey, setNewKey] = useState("");
+  const [newLabel, setNewLabel] = useState("");
+  const [showNewKey, setShowNewKey] = useState(false);
+  const [isAdding, setIsAdding] = useState(true);
+
+  const { data: keys, isLoading } = useQuery<ProviderKey[]>({
+    queryKey: [`/api/admin/providers/${provider.id}/keys`],
+  });
+
+  const addKey = useMutation({
+    mutationFn: async () =>
+      apiRequest("POST", `/api/admin/providers/${provider.id}/keys`, {
+        apiKey: newKey,
+        keyLabel: newLabel || null,
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: [`/api/admin/providers/${provider.id}/keys`] });
+      setNewKey("");
+      setNewLabel("");
+      setIsAdding(false);
+      toast({ title: "API key added" });
+    },
+    onError: () => toast({ title: "Failed to add key", variant: "destructive" }),
+  });
+
+  const toggleKey = useMutation({
+    mutationFn: async ({ id, isEnabled }: { id: number; isEnabled: boolean }) =>
+      apiRequest("PATCH", `/api/admin/providers/${provider.id}/keys/${id}`, { isEnabled }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: [`/api/admin/providers/${provider.id}/keys`] });
+    },
+  });
+
+  const deleteKey = useMutation({
+    mutationFn: async (id: number) =>
+      apiRequest("DELETE", `/api/admin/providers/${provider.id}/keys/${id}`),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: [`/api/admin/providers/${provider.id}/keys`] });
+      toast({ title: "API key removed" });
+    },
+    onError: () => toast({ title: "Failed to remove key", variant: "destructive" }),
+  });
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <p className="text-sm text-muted-foreground">
+          Requests are distributed round-robin across enabled keys. If a key fails, the next key is tried automatically.
+        </p>
+      </div>
+
+      {isLoading ? (
+        <div className="space-y-2">
+          <Skeleton className="h-10 w-full" />
+          <Skeleton className="h-10 w-full" />
+        </div>
+      ) : keys && keys.length > 0 ? (
+        <div className="space-y-2">
+          {keys.map((key, idx) => (
+            <div
+              key={key.id}
+              className="flex items-center gap-2 p-2 rounded-md border bg-muted/30"
+            >
+              <span className="text-xs text-muted-foreground w-5 text-center">{idx + 1}</span>
+              <KeyRound className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
+              <span className="font-mono text-xs flex-1 truncate">
+                {key.keyLabel ? (
+                  <span className="text-foreground mr-1">{key.keyLabel}:</span>
+                ) : null}
+                {(key as any).apiKey}
+              </span>
+              <Switch
+                checked={key.isEnabled ?? true}
+                onCheckedChange={(checked) => toggleKey.mutate({ id: key.id, isEnabled: checked })}
+                className="scale-75"
+              />
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-6 w-6 shrink-0 text-destructive hover:text-destructive"
+                onClick={() => deleteKey.mutate(key.id)}
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+              </Button>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <p className="text-sm text-center text-muted-foreground py-4 border border-dashed rounded-md">
+          No API keys added yet. Add one below.
+        </p>
+      )}
+
+      <div className="border rounded-md overflow-hidden">
+        <div className="flex items-center justify-between px-3 py-2 bg-muted/40 border-b">
+          <span className="text-xs font-medium flex items-center gap-1.5">
+            <Plus className="w-3.5 h-3.5" />
+            Add New Key
+          </span>
+          {isAdding && (
+            <button
+              type="button"
+              className="text-muted-foreground hover:text-foreground"
+              onClick={() => { setIsAdding(false); setNewKey(""); setNewLabel(""); }}
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          )}
+        </div>
+
+        {isAdding ? (
+          <div className="p-3 space-y-3">
+            <div className="space-y-1">
+              <Label className="text-xs">Label (optional)</Label>
+              <Input
+                value={newLabel}
+                onChange={(e) => setNewLabel(e.target.value)}
+                placeholder="e.g. Key 1, Production"
+                className="h-8 text-sm"
+              />
+            </div>
+            <div className="space-y-1">
+              <Label className="text-xs">API Key</Label>
+              <div className="relative">
+                <Input
+                  type={showNewKey ? "text" : "password"}
+                  value={newKey}
+                  onChange={(e) => setNewKey(e.target.value)}
+                  placeholder="sk-..."
+                  className="h-8 text-sm pr-8 font-mono"
+                  data-testid="input-provider-api-key"
+                  autoFocus
+                />
+                <button
+                  type="button"
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                  onClick={() => setShowNewKey((v) => !v)}
+                >
+                  {showNewKey ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                </button>
+              </div>
+            </div>
+            <Button
+              size="sm"
+              className="w-full"
+              onClick={() => addKey.mutate()}
+              disabled={!newKey.trim() || addKey.isPending}
+            >
+              {addKey.isPending ? <Loader2 className="w-3.5 h-3.5 mr-1 animate-spin" /> : <Plus className="w-3.5 h-3.5 mr-1" />}
+              Add Key
+            </Button>
+          </div>
+        ) : (
+          <button
+            type="button"
+            className="w-full px-3 py-2 text-xs text-muted-foreground hover:text-foreground hover:bg-muted/30 transition-colors text-left"
+            onClick={() => setIsAdding(true)}
+          >
+            Click to add another key...
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function ProvidersSection() {
   const { toast } = useToast();
   const [isAddOpen, setIsAddOpen] = useState(false);
   const [editingProvider, setEditingProvider] = useState<Provider | null>(null);
+  const [keyPoolProvider, setKeyPoolProvider] = useState<Provider | null>(null);
 
   const [formData, setFormData] = useState({
     name: "",
     baseUrl: "",
     authType: "bearer",
-    apiKey: "",
     customHeaders: "{}",
     healthCheckEndpoint: "",
   });
@@ -417,7 +589,6 @@ function ProvidersSection() {
       name: "",
       baseUrl: "",
       authType: "bearer",
-      apiKey: "",
       customHeaders: "{}",
       healthCheckEndpoint: "",
     });
@@ -429,7 +600,6 @@ function ProvidersSection() {
         name: editingProvider.name,
         baseUrl: editingProvider.baseUrl,
         authType: editingProvider.authType,
-        apiKey: editingProvider.apiKey || "",
         customHeaders: JSON.stringify(editingProvider.customHeaders || {}, null, 2),
         healthCheckEndpoint: editingProvider.healthCheckEndpoint || "",
       });
@@ -471,16 +641,6 @@ function ProvidersSection() {
             <SelectItem value="custom">Custom Header</SelectItem>
           </SelectContent>
         </Select>
-      </div>
-      <div className="space-y-2">
-        <Label>API Key</Label>
-        <Input
-          type="password"
-          value={formData.apiKey}
-          onChange={(e) => setFormData((f) => ({ ...f, apiKey: e.target.value }))}
-          placeholder="sk-..."
-          data-testid="input-provider-api-key"
-        />
       </div>
       <div className="space-y-2">
         <Label>Custom Headers (JSON)</Label>
@@ -557,55 +717,13 @@ function ProvidersSection() {
       ) : (
         <div className="grid md:grid-cols-2 gap-4">
           {providers?.map((provider) => (
-            <Card key={provider.id} data-testid={`card-provider-${provider.id}`}>
-              <CardHeader className="flex flex-row items-start justify-between gap-2 space-y-0">
-                <div>
-                  <CardTitle className="text-base">{provider.name}</CardTitle>
-                  <CardDescription className="text-xs truncate max-w-48">
-                    {provider.authType === "puterjs" ? "User-Pays (no API key)" : provider.baseUrl}
-                  </CardDescription>
-                </div>
-                <div className="flex items-center gap-2">
-                  <Badge variant={provider.isEnabled ? "default" : "secondary"}>
-                    {provider.isEnabled ? "Enabled" : "Disabled"}
-                  </Badge>
-                  {provider.authType === "puterjs" ? (
-                    <Badge variant="secondary">Built-in</Badge>
-                  ) : (
-                    <DropdownMenu>
-                      <DropdownMenuTrigger asChild>
-                        <Button variant="ghost" size="icon">
-                          <MoreVertical className="w-4 h-4" />
-                        </Button>
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent align="end">
-                        <DropdownMenuItem onClick={() => setEditingProvider(provider)}>
-                          <Edit2 className="w-4 h-4 mr-2" />
-                          Edit
-                        </DropdownMenuItem>
-                        <DropdownMenuItem
-                          onClick={() => deleteProvider.mutate(provider.id)}
-                          className="text-destructive"
-                        >
-                          <Trash2 className="w-4 h-4 mr-2" />
-                          Delete
-                        </DropdownMenuItem>
-                      </DropdownMenuContent>
-                    </DropdownMenu>
-                  )}
-                </div>
-              </CardHeader>
-              <CardContent>
-                <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                  <Badge variant="outline" className="text-xs">
-                    {provider.authType === "puterjs" ? "user-pays" : provider.authType}
-                  </Badge>
-                  {provider.authType === "puterjs" && (
-                    <span className="text-xs">No API key required</span>
-                  )}
-                </div>
-              </CardContent>
-            </Card>
+            <ProviderCard
+              key={provider.id}
+              provider={provider}
+              onEdit={() => setEditingProvider(provider)}
+              onDelete={() => deleteProvider.mutate(provider.id)}
+              onManageKeys={() => setKeyPoolProvider(provider)}
+            />
           ))}
         </div>
       )}
@@ -623,7 +741,104 @@ function ProvidersSection() {
           />
         </DialogContent>
       </Dialog>
+
+      <Dialog open={!!keyPoolProvider} onOpenChange={() => setKeyPoolProvider(null)}>
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <KeyRound className="w-4 h-4" />
+              API Key Pool — {keyPoolProvider?.name}
+            </DialogTitle>
+          </DialogHeader>
+          {keyPoolProvider && <KeyPoolManager provider={keyPoolProvider} />}
+        </DialogContent>
+      </Dialog>
     </div>
+  );
+}
+
+function ProviderCard({
+  provider,
+  onEdit,
+  onDelete,
+  onManageKeys,
+}: {
+  provider: Provider;
+  onEdit: () => void;
+  onDelete: () => void;
+  onManageKeys: () => void;
+}) {
+  const { data: keys } = useQuery<ProviderKey[]>({
+    queryKey: [`/api/admin/providers/${provider.id}/keys`],
+    enabled: provider.authType !== "puterjs",
+  });
+
+  const enabledKeyCount = keys?.filter((k) => k.isEnabled).length ?? 0;
+
+  return (
+    <Card data-testid={`card-provider-${provider.id}`}>
+      <CardHeader className="flex flex-row items-start justify-between gap-2 space-y-0">
+        <div>
+          <CardTitle className="text-base">{provider.name}</CardTitle>
+          <CardDescription className="text-xs truncate max-w-48">
+            {provider.authType === "puterjs" ? "User-Pays (no API key)" : provider.baseUrl}
+          </CardDescription>
+        </div>
+        <div className="flex items-center gap-2">
+          <Badge variant={provider.isEnabled ? "default" : "secondary"}>
+            {provider.isEnabled ? "Enabled" : "Disabled"}
+          </Badge>
+          {provider.authType === "puterjs" ? (
+            <Badge variant="secondary">Built-in</Badge>
+          ) : (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="ghost" size="icon">
+                  <MoreVertical className="w-4 h-4" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem onClick={onEdit}>
+                  <Edit2 className="w-4 h-4 mr-2" />
+                  Edit
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={onManageKeys}>
+                  <KeyRound className="w-4 h-4 mr-2" />
+                  Manage Keys
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={onDelete} className="text-destructive">
+                  <Trash2 className="w-4 h-4 mr-2" />
+                  Delete
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
+        </div>
+      </CardHeader>
+      <CardContent>
+        <div className="flex items-center gap-2 text-sm text-muted-foreground">
+          <Badge variant="outline" className="text-xs">
+            {provider.authType === "puterjs" ? "user-pays" : provider.authType}
+          </Badge>
+          {provider.authType !== "puterjs" && (
+            <button
+              onClick={onManageKeys}
+              className="flex items-center gap-1 text-xs hover:text-foreground transition-colors"
+            >
+              <KeyRound className="w-3 h-3" />
+              {enabledKeyCount === 0 ? (
+                <span className="text-destructive">No keys</span>
+              ) : (
+                <span>{enabledKeyCount} key{enabledKeyCount !== 1 ? "s" : ""}</span>
+              )}
+            </button>
+          )}
+          {provider.authType === "puterjs" && (
+            <span className="text-xs">No API key required</span>
+          )}
+        </div>
+      </CardContent>
+    </Card>
   );
 }
 

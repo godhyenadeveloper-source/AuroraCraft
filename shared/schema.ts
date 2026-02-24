@@ -53,6 +53,16 @@ export const providers = pgTable("providers", {
   createdAt: timestamp("created_at").defaultNow(),
 });
 
+// Multiple API keys per provider (for round-robin distribution)
+export const providerKeys = pgTable("provider_keys", {
+  id: serial("id").primaryKey(),
+  providerId: integer("provider_id").references(() => providers.id, { onDelete: "cascade" }).notNull(),
+  keyLabel: varchar("key_label"),
+  apiKey: varchar("api_key", { length: 2048 }).notNull(),
+  isEnabled: boolean("is_enabled").default(true),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+
 // AI Models (associated with providers)
 export const models = pgTable("models", {
   id: serial("id").primaryKey(),
@@ -336,6 +346,11 @@ export const insertMemorySchema = createInsertSchema(memories).omit({
   updatedAt: true,
 });
 
+export const insertProviderKeySchema = createInsertSchema(providerKeys).omit({
+  id: true,
+  createdAt: true,
+});
+
 // Types
 export type UpsertUser = typeof users.$inferInsert;
 export type User = typeof users.$inferSelect;
@@ -370,3 +385,6 @@ export type InsertSiteSetting = z.infer<typeof insertSiteSettingSchema>;
 
 export type Memory = typeof memories.$inferSelect;
 export type InsertMemory = z.infer<typeof insertMemorySchema>;
+
+export type ProviderKey = typeof providerKeys.$inferSelect;
+export type InsertProviderKey = z.infer<typeof insertProviderKeySchema>;

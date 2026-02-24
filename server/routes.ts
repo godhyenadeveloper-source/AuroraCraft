@@ -16,6 +16,23 @@ import { classifyThinkingType, resolveThinkingContext } from "@shared/thinking-t
 import { parseThinking } from "@shared/thinking-parser";
 import { memoryService } from "./memory";
 
+// Round-robin counters for multi-key providers (in-memory, per process)
+const routesKeyCounters = new Map<number, number>();
+
+async function getProviderApiKeys(providerId: number, legacyApiKey: string | null | undefined): Promise<string[]> {
+  const keys = await storage.getProviderKeys(providerId);
+  const enabled = keys.filter((k) => k.isEnabled).map((k) => k.apiKey);
+  if (enabled.length > 0) return enabled;
+  if (legacyApiKey) return [legacyApiKey];
+  return [];
+}
+
+function nextKeyIndex(providerId: number, count: number): number {
+  const cur = routesKeyCounters.get(providerId) ?? 0;
+  routesKeyCounters.set(providerId, (cur + 1) % count);
+  return cur % count;
+}
+
 function isBuiltInProvider(provider: any): boolean {
   return provider?.authType === "puterjs";
 }
@@ -268,18 +285,13 @@ export async function registerRoutes(
         modelForUsage = model;
         if (model && model.providerId) {
           const provider = await storage.getProvider(model.providerId);
-          if (provider && provider.apiKey) {
-            try {
-              // the newest OpenAI model is "gpt-5" which was released August 7, 2025. do not change this unless explicitly requested by the user
-              const openai = new OpenAI({
-                apiKey: provider.apiKey,
-                baseURL: provider.baseUrl,
-              });
-
+          if (provider) {
+            const apiKeys = await getProviderApiKeys(provider.id, provider.apiKey);
+            if (apiKeys.length > 0) {
               const previousMessages = await storage.getMessages(session.id);
               const files = await storage.getFiles(session.id);
               const compilations = await storage.getCompilations(session.id);
-              
+
               const chatThinking = classifyThinkingType("conversation", { userRequest: content });
               const memoryContext = await memoryService.getContextForAI(req.user.id, session.id);
               const systemPrompt = buildSystemPrompt(mode, {
@@ -290,26 +302,37 @@ export async function registerRoutes(
                 memoryContext,
               }, chatThinking);
 
-              const response = await openai.chat.completions.create({
-                model: model.name,
-                messages: [
-                  { role: "system", content: systemPrompt },
-                  ...previousMessages.slice(-20).map((m) => ({
-                    role: m.role as "user" | "assistant",
-                    content: m.content,
-                  })),
-                  { role: "user", content },
-                ],
-                max_completion_tokens: 4096,
-              });
-
-              const rawResponse = response.choices[0]?.message?.content || aiResponse;
-              // Strip thinking tags — only save the visible output
-              const { output } = parseThinking(rawResponse);
-              aiResponse = output;
-            } catch (aiError) {
-              console.error("AI error:", aiError);
-              aiResponse = "I encountered an error processing your request. Please try again.";
+              const startIdx = nextKeyIndex(provider.id, apiKeys.length);
+              let chatAiSuccess = false;
+              for (let attempt = 0; attempt < apiKeys.length; attempt++) {
+                const apiKey = apiKeys[(startIdx + attempt) % apiKeys.length];
+                try {
+                  // the newest OpenAI model is "gpt-5" which was released August 7, 2025. do not change this unless explicitly requested by the user
+                  const openai = new OpenAI({ apiKey, baseURL: provider.baseUrl });
+                  const response = await openai.chat.completions.create({
+                    model: model.name,
+                    messages: [
+                      { role: "system", content: systemPrompt },
+                      ...previousMessages.slice(-20).map((m) => ({
+                        role: m.role as "user" | "assistant",
+                        content: m.content,
+                      })),
+                      { role: "user", content },
+                    ],
+                    max_completion_tokens: 4096,
+                  });
+                  const rawResponse = response.choices[0]?.message?.content || aiResponse;
+                  const { output } = parseThinking(rawResponse);
+                  aiResponse = output;
+                  chatAiSuccess = true;
+                  break;
+                } catch (aiError) {
+                  console.warn(`[routes] Chat key attempt ${attempt + 1}/${apiKeys.length} failed:`, aiError);
+                }
+              }
+              if (!chatAiSuccess) {
+                aiResponse = "I encountered an error processing your request. Please try again.";
+              }
             }
           }
         }
@@ -421,17 +444,13 @@ export async function registerRoutes(
         modelForUsage = model;
         if (model && model.providerId) {
           const provider = await storage.getProvider(model.providerId);
-          if (provider && provider.apiKey) {
-            try {
-              const openai = new OpenAI({
-                apiKey: provider.apiKey,
-                baseURL: provider.baseUrl,
-              });
-
+          if (provider) {
+            const apiKeys = await getProviderApiKeys(provider.id, provider.apiKey);
+            if (apiKeys.length > 0) {
               const previousMessages = await storage.getMessages(session.id);
               const files = await storage.getFiles(session.id);
               const compilations = await storage.getCompilations(session.id);
-              
+
               const streamChatThinking = classifyThinkingType("conversation", { userRequest: content });
               const streamMemoryContext = await memoryService.getContextForAI(req.user.id, session.id);
               const systemPrompt = buildSystemPrompt(mode, {
@@ -442,43 +461,54 @@ export async function registerRoutes(
                 memoryContext: streamMemoryContext,
               }, streamChatThinking);
 
-              const stream = await openai.chat.completions.create({
-                model: model.name,
-                messages: [
-                  { role: "system", content: systemPrompt },
-                  ...previousMessages.slice(-20).map((m) => ({
-                    role: m.role as "user" | "assistant",
-                    content: m.content,
-                  })),
-                  { role: "user", content },
-                ],
-                max_completion_tokens: 4096,
-                stream: true,
-              });
+              const startIdx = nextKeyIndex(provider.id, apiKeys.length);
+              let streamSuccess = false;
+              for (let attempt = 0; attempt < apiKeys.length; attempt++) {
+                const apiKey = apiKeys[(startIdx + attempt) % apiKeys.length];
+                try {
+                  const openai = new OpenAI({ apiKey, baseURL: provider.baseUrl });
+                  const stream = await openai.chat.completions.create({
+                    model: model.name,
+                    messages: [
+                      { role: "system", content: systemPrompt },
+                      ...previousMessages.slice(-20).map((m) => ({
+                        role: m.role as "user" | "assistant",
+                        content: m.content,
+                      })),
+                      { role: "user", content },
+                    ],
+                    max_completion_tokens: 4096,
+                    stream: true,
+                  });
 
-              for await (const chunk of stream) {
-                const text = chunk.choices[0]?.delta?.content || "";
-                if (text) {
-                  fullResponse += text;
-                  res.write(`data: ${JSON.stringify({ type: "chunk", content: text })}\n\n`);
+                  for await (const chunk of stream) {
+                    const text = chunk.choices[0]?.delta?.content || "";
+                    if (text) {
+                      fullResponse += text;
+                      res.write(`data: ${JSON.stringify({ type: "chunk", content: text })}\n\n`);
+                    }
+                  }
+
+                  // After streaming, parse thinking from the full response
+                  const { thinking: streamThinkContent, output: cleanResponse } = parseThinking(fullResponse);
+                  if (streamThinkContent) {
+                    const thinkCtx = resolveThinkingContext(streamChatThinking.typeId, streamChatThinking.level);
+                    res.write(`data: ${JSON.stringify({
+                      type: "thinking-data",
+                      context: { ...thinkCtx, content: streamThinkContent },
+                    })}\n\n`);
+                  }
+                  fullResponse = cleanResponse;
+                  streamSuccess = true;
+                  break;
+                } catch (aiError) {
+                  console.warn(`[routes] Stream chat key attempt ${attempt + 1}/${apiKeys.length} failed:`, aiError);
                 }
               }
-
-              // After streaming, parse thinking from the full response
-              const { thinking: streamThinkContent, output: cleanResponse } = parseThinking(fullResponse);
-              if (streamThinkContent) {
-                const thinkCtx = resolveThinkingContext(streamChatThinking.typeId, streamChatThinking.level);
-                res.write(`data: ${JSON.stringify({
-                  type: "thinking-data",
-                  context: { ...thinkCtx, content: streamThinkContent },
-                })}\n\n`);
+              if (!streamSuccess) {
+                fullResponse = "I encountered an error processing your request. Please try again.";
+                res.write(`data: ${JSON.stringify({ type: "error", content: fullResponse })}\n\n`);
               }
-              // Replace fullResponse with clean version for DB storage
-              fullResponse = cleanResponse;
-            } catch (aiError) {
-              console.error("AI streaming error:", aiError);
-              fullResponse = "I encountered an error processing your request. Please try again.";
-              res.write(`data: ${JSON.stringify({ type: "error", content: fullResponse })}\n\n`);
             }
           }
         }
@@ -585,32 +615,31 @@ export async function registerRoutes(
         const model = await storage.getModel(modelId);
         if (model && model.providerId) {
           const provider = await storage.getProvider(model.providerId);
-          if (provider && provider.apiKey) {
-            try {
-              const openai = new OpenAI({
-                apiKey: provider.apiKey,
-                baseURL: provider.baseUrl,
-              });
-
-              const response = await openai.chat.completions.create({
-                model: model.name,
-                messages: [
-                  {
-                    role: "system",
-                    content: buildEnhancePrompt(framework),
-                  },
-                  { role: "user", content: prompt },
-                ],
-                max_completion_tokens: 500,
-              });
-
-              enhancedPrompt = response.choices[0]?.message?.content || prompt;
-
-              const inputChars = typeof prompt === "string" ? prompt.length : 0;
-              const outputChars = enhancedPrompt ? enhancedPrompt.length : 0;
-              tokensUsed = computeTokenUsageFromChars(model, inputChars, outputChars);
-            } catch (aiError) {
-              console.error("AI error in enhance:", aiError);
+          if (provider) {
+            const apiKeys = await getProviderApiKeys(provider.id, provider.apiKey);
+            if (apiKeys.length > 0) {
+              const startIdx = nextKeyIndex(provider.id, apiKeys.length);
+              for (let attempt = 0; attempt < apiKeys.length; attempt++) {
+                const apiKey = apiKeys[(startIdx + attempt) % apiKeys.length];
+                try {
+                  const openai = new OpenAI({ apiKey, baseURL: provider.baseUrl });
+                  const response = await openai.chat.completions.create({
+                    model: model.name,
+                    messages: [
+                      { role: "system", content: buildEnhancePrompt(framework) },
+                      { role: "user", content: prompt },
+                    ],
+                    max_completion_tokens: 500,
+                  });
+                  enhancedPrompt = response.choices[0]?.message?.content || prompt;
+                  const inputChars = typeof prompt === "string" ? prompt.length : 0;
+                  const outputChars = enhancedPrompt ? enhancedPrompt.length : 0;
+                  tokensUsed = computeTokenUsageFromChars(model, inputChars, outputChars);
+                  break;
+                } catch (aiError) {
+                  console.warn(`[routes] Enhance key attempt ${attempt + 1}/${apiKeys.length} failed:`, aiError);
+                }
+              }
             }
           }
         }
@@ -1028,6 +1057,64 @@ export async function registerRoutes(
     } catch (error) {
       console.error("Error deleting provider:", error);
       res.status(500).json({ message: "Failed to delete provider" });
+    }
+  });
+
+  // Admin provider keys (multi-key pool per provider)
+  app.get("/api/admin/providers/:id/keys", isAuthenticated, isAdmin, async (req, res) => {
+    try {
+      const providerId = parseInt(req.params.id);
+      const keys = await storage.getProviderKeys(providerId);
+      // Mask keys — show only last 4 characters
+      const masked = keys.map((k) => ({
+        ...k,
+        apiKey: k.apiKey.length > 4 ? `...${k.apiKey.slice(-4)}` : "****",
+      }));
+      res.json(masked);
+    } catch (error) {
+      console.error("Error fetching provider keys:", error);
+      res.status(500).json({ message: "Failed to fetch provider keys" });
+    }
+  });
+
+  app.post("/api/admin/providers/:id/keys", isAuthenticated, isAdmin, async (req, res) => {
+    try {
+      const providerId = parseInt(req.params.id);
+      const provider = await storage.getProvider(providerId);
+      if (!provider) return res.status(404).json({ message: "Provider not found" });
+      const { apiKey, keyLabel } = req.body;
+      if (!apiKey || typeof apiKey !== "string" || apiKey.trim().length === 0) {
+        return res.status(400).json({ message: "apiKey is required" });
+      }
+      const key = await storage.addProviderKey({ providerId, apiKey: apiKey.trim(), keyLabel: keyLabel || null, isEnabled: true });
+      res.json({ ...key, apiKey: key.apiKey.length > 4 ? `...${key.apiKey.slice(-4)}` : "****" });
+    } catch (error) {
+      console.error("Error adding provider key:", error);
+      res.status(500).json({ message: "Failed to add provider key" });
+    }
+  });
+
+  app.patch("/api/admin/providers/:id/keys/:keyId", isAuthenticated, isAdmin, async (req, res) => {
+    try {
+      const keyId = parseInt(req.params.keyId);
+      const { keyLabel, isEnabled } = req.body;
+      const updated = await storage.updateProviderKey(keyId, { keyLabel, isEnabled });
+      if (!updated) return res.status(404).json({ message: "Key not found" });
+      res.json({ ...updated, apiKey: updated.apiKey.length > 4 ? `...${updated.apiKey.slice(-4)}` : "****" });
+    } catch (error) {
+      console.error("Error updating provider key:", error);
+      res.status(500).json({ message: "Failed to update provider key" });
+    }
+  });
+
+  app.delete("/api/admin/providers/:id/keys/:keyId", isAuthenticated, isAdmin, async (req, res) => {
+    try {
+      const keyId = parseInt(req.params.keyId);
+      await storage.deleteProviderKey(keyId);
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Error deleting provider key:", error);
+      res.status(500).json({ message: "Failed to delete provider key" });
     }
   });
 
@@ -1485,8 +1572,10 @@ export async function registerRoutes(
       if (!provider) {
         return res.status(404).json({ message: "Provider not found" });
       }
-      if (!provider.apiKey) {
-        return res.status(400).json({ message: `API key not configured for ${provider.name}. Please add your API key in the admin panel.` });
+
+      const apiKeys = await getProviderApiKeys(provider.id, provider.apiKey);
+      if (apiKeys.length === 0) {
+        return res.status(400).json({ message: `No API keys configured for ${provider.name}. Please add an API key in the admin panel.` });
       }
 
       // Set up SSE headers
@@ -1504,140 +1593,156 @@ export async function registerRoutes(
       ];
 
       const inputChars = chatMessages.reduce((sum, m) => sum + m.content.length, 0);
-      let outputChars = 0;
-      let finishReason = "";
 
-      try {
-        // Handle Google Gemini API
-        if (provider.name.toLowerCase() === "google") {
-          const modelName = model.name.includes("/") ? model.name.split("/").pop() : model.name;
-          const url = `${provider.baseUrl}models/${modelName}:streamGenerateContent?key=${provider.apiKey}&alt=sse`;
-          
-          const contents = chatMessages.slice(1).map((m: any) => ({
-            role: m.role === "assistant" ? "model" : "user",
-            parts: [{ text: m.content }]
-          }));
+      const startIdx = nextKeyIndex(provider.id, apiKeys.length);
+      let generateSuccess = false;
+      let lastGenerateError: any = null;
 
-          const response = await fetch(url, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              systemInstruction: { parts: [{ text: systemPrompt }] },
-              contents,
-              generationConfig: { maxOutputTokens: maxTokens || 4096 }
-            }),
-          });
+      for (let attempt = 0; attempt < apiKeys.length; attempt++) {
+        const apiKey = apiKeys[(startIdx + attempt) % apiKeys.length];
+        let outputChars = 0;
+        let finishReason = "";
 
-          if (!response.ok) {
-            const errorText = await response.text();
-            throw new Error(`API error: ${response.status} - ${errorText}`);
-          }
+        try {
+          // Handle Google Gemini API
+          if (provider.name.toLowerCase() === "google") {
+            const modelName = model.name.includes("/") ? model.name.split("/").pop() : model.name;
+            const url = `${provider.baseUrl}models/${modelName}:streamGenerateContent?key=${apiKey}&alt=sse`;
 
-          const reader = response.body?.getReader();
-          const decoder = new TextDecoder();
-          
-          while (reader) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            
-            const chunk = decoder.decode(value);
-            const lines = chunk.split("\n").filter(line => line.startsWith("data: "));
-            
-            for (const line of lines) {
-              try {
-                const data = JSON.parse(line.slice(6));
-                const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
-                if (text) {
-                  outputChars += text.length;
-                  res.write(`data: ${JSON.stringify({ type: "chunk", content: text })}\n\n`);
-                }
-                if (data.candidates?.[0]?.finishReason) {
-                  finishReason = data.candidates[0].finishReason;
-                }
-              } catch {}
+            const contents = chatMessages.slice(1).map((m: any) => ({
+              role: m.role === "assistant" ? "model" : "user",
+              parts: [{ text: m.content }]
+            }));
+
+            const response = await fetch(url, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                systemInstruction: { parts: [{ text: systemPrompt }] },
+                contents,
+                generationConfig: { maxOutputTokens: maxTokens || 4096 }
+              }),
+            });
+
+            if (!response.ok) {
+              const errorText = await response.text();
+              throw new Error(`API error: ${response.status} - ${errorText}`);
             }
-          }
 
-          res.write(`data: ${JSON.stringify({ type: "done", inputChars, outputChars, finishReason })}\n\n`);
-          res.end();
-        }
-        // Handle Bytez-style API (model in URL path, direct API key auth)
-        else if (provider.authType === "api_key" || provider.name.toLowerCase() === "bytez") {
-          const url = `${provider.baseUrl}${model.name}`;
-          
-          const response = await fetch(url, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "Authorization": provider.apiKey,
-            },
-            body: JSON.stringify({
+            const reader = response.body?.getReader();
+            const decoder = new TextDecoder();
+
+            while (reader) {
+              const { done, value } = await reader.read();
+              if (done) break;
+
+              const chunk = decoder.decode(value);
+              const lines = chunk.split("\n").filter(line => line.startsWith("data: "));
+
+              for (const line of lines) {
+                try {
+                  const data = JSON.parse(line.slice(6));
+                  const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+                  if (text) {
+                    outputChars += text.length;
+                    res.write(`data: ${JSON.stringify({ type: "chunk", content: text })}\n\n`);
+                  }
+                  if (data.candidates?.[0]?.finishReason) {
+                    finishReason = data.candidates[0].finishReason;
+                  }
+                } catch {}
+              }
+            }
+
+            res.write(`data: ${JSON.stringify({ type: "done", inputChars, outputChars, finishReason })}\n\n`);
+            res.end();
+            generateSuccess = true;
+          }
+          // Handle Bytez-style API (model in URL path, direct API key auth)
+          else if (provider.authType === "api_key" || provider.name.toLowerCase() === "bytez") {
+            const url = `${provider.baseUrl}${model.name}`;
+
+            const response = await fetch(url, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "Authorization": apiKey,
+              },
+              body: JSON.stringify({
+                messages: chatMessages,
+                max_tokens: maxTokens || 4096,
+              }),
+            });
+
+            if (!response.ok) {
+              const errorText = await response.text();
+              throw new Error(`API error: ${response.status} - ${errorText}`);
+            }
+
+            const data = await response.json();
+            const content = data.choices?.[0]?.message?.content || data.output || data.response || "";
+            outputChars = content.length;
+            finishReason = data.choices?.[0]?.finish_reason || "stop";
+
+            res.write(`data: ${JSON.stringify({ type: "chunk", content })}\n\n`);
+            res.write(`data: ${JSON.stringify({ type: "done", inputChars, outputChars, finishReason })}\n\n`);
+            res.end();
+            generateSuccess = true;
+          } else {
+            // OpenAI-compatible providers
+            const openai = new OpenAI({ apiKey, baseURL: provider.baseUrl });
+
+            const stream = await openai.chat.completions.create({
+              model: model.name,
               messages: chatMessages,
-              max_tokens: maxTokens || 4096,
-            }),
-          });
+              max_completion_tokens: maxTokens || 4096,
+              stream: true,
+            });
 
-          if (!response.ok) {
-            const errorText = await response.text();
-            throw new Error(`API error: ${response.status} - ${errorText}`);
+            for await (const chunk of stream) {
+              const text = chunk.choices[0]?.delta?.content || "";
+              if (text) {
+                outputChars += text.length;
+                res.write(`data: ${JSON.stringify({ type: "chunk", content: text })}\n\n`);
+              }
+              if (chunk.choices[0]?.finish_reason) {
+                finishReason = chunk.choices[0].finish_reason;
+              }
+            }
+
+            res.write(`data: ${JSON.stringify({ type: "done", inputChars, outputChars, finishReason })}\n\n`);
+            res.end();
+            generateSuccess = true;
           }
 
-          const data = await response.json();
-          const content = data.choices?.[0]?.message?.content || data.output || data.response || "";
-          outputChars = content.length;
-          finishReason = data.choices?.[0]?.finish_reason || "stop";
-          
-          res.write(`data: ${JSON.stringify({ type: "chunk", content })}\n\n`);
-          res.write(`data: ${JSON.stringify({ type: "done", inputChars, outputChars, finishReason })}\n\n`);
-          res.end();
-        } else {
-          // OpenAI-compatible providers
-          const openai = new OpenAI({
-            apiKey: provider.apiKey,
-            baseURL: provider.baseUrl,
-          });
-
-          const stream = await openai.chat.completions.create({
-            model: model.name,
-            messages: chatMessages,
-            max_completion_tokens: maxTokens || 4096,
-            stream: true,
-          });
-
-          for await (const chunk of stream) {
-            const text = chunk.choices[0]?.delta?.content || "";
-            if (text) {
-              outputChars += text.length;
-              res.write(`data: ${JSON.stringify({ type: "chunk", content: text })}\n\n`);
-            }
-            if (chunk.choices[0]?.finish_reason) {
-              finishReason = chunk.choices[0].finish_reason;
-            }
-          }
-
-          res.write(`data: ${JSON.stringify({ type: "done", inputChars, outputChars, finishReason })}\n\n`);
-          res.end();
+          break; // success — stop retrying
+        } catch (aiError: any) {
+          lastGenerateError = aiError;
+          console.warn(`[routes] /api/ai/generate key attempt ${attempt + 1}/${apiKeys.length} failed for provider "${provider.name}":`, aiError?.message || aiError);
+          // If SSE headers already sent (partial stream started), we can't retry — bail out
+          if (res.headersSent) break;
         }
-      } catch (aiError: any) {
-        console.error("AI generate error:", aiError);
-        let errorMsg = "AI generation failed";
+      }
+
+      if (!generateSuccess) {
+        const aiError = lastGenerateError;
+        let errorMsg = `All ${apiKeys.length} API key(s) failed for ${provider.name}. Please try again or check your API keys.`;
         let errorDetails = "";
-        
+
         if (aiError?.status === 401 || aiError?.status === 403) {
-          errorMsg = `Authentication failed for ${provider.name}. Please check your API key.`;
-          errorDetails = "Invalid or expired API key. Get a new key from the provider's website.";
+          errorMsg = `Authentication failed for ${provider.name}. Please check your API keys.`;
+          errorDetails = "Invalid or expired API key.";
         } else if (aiError?.status === 404) {
           errorMsg = `Model "${model.name}" not found on ${provider.name}.`;
           errorDetails = "The model may have been renamed or removed.";
         } else if (aiError?.status === 429) {
-          errorMsg = "Rate limit exceeded. Please try again later.";
+          errorMsg = "Rate limit exceeded on all API keys. Please try again later.";
           errorDetails = "Too many requests to the API.";
         } else if (aiError?.message) {
           errorMsg = aiError.message;
           if (aiError?.error) errorDetails = JSON.stringify(aiError.error);
         }
-        
-        console.error("AI error details:", errorDetails || aiError?.status);
+
         if (!res.headersSent) {
           res.status(500).json({ message: errorMsg, details: errorDetails });
         } else {

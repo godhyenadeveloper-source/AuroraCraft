@@ -1,6 +1,7 @@
 import {
   users,
   providers,
+  providerKeys,
   models,
   chatSessions,
   chatMessages,
@@ -14,6 +15,8 @@ import {
   type UpsertUser,
   type Provider,
   type InsertProvider,
+  type ProviderKey,
+  type InsertProviderKey,
   type Model,
   type InsertModel,
   type ChatSession,
@@ -64,6 +67,12 @@ export interface IStorage {
   createProvider(data: InsertProvider): Promise<Provider>;
   updateProvider(id: number, data: Partial<InsertProvider>): Promise<Provider | undefined>;
   deleteProvider(id: number): Promise<void>;
+
+  // Provider key operations (multi-key pool)
+  getProviderKeys(providerId: number): Promise<ProviderKey[]>;
+  addProviderKey(data: InsertProviderKey): Promise<ProviderKey>;
+  updateProviderKey(id: number, data: Partial<InsertProviderKey>): Promise<ProviderKey | undefined>;
+  deleteProviderKey(id: number): Promise<void>;
 
   // Model operations
   getModels(): Promise<Model[]>;
@@ -197,6 +206,25 @@ export class DatabaseStorage implements IStorage {
 
   async deleteProvider(id: number): Promise<void> {
     await db.delete(providers).where(eq(providers.id, id));
+  }
+
+  // Provider key operations (multi-key pool)
+  async getProviderKeys(providerId: number): Promise<ProviderKey[]> {
+    return db.select().from(providerKeys).where(eq(providerKeys.providerId, providerId)).orderBy(providerKeys.id);
+  }
+
+  async addProviderKey(data: InsertProviderKey): Promise<ProviderKey> {
+    const [key] = await db.insert(providerKeys).values(data).returning();
+    return key;
+  }
+
+  async updateProviderKey(id: number, data: Partial<InsertProviderKey>): Promise<ProviderKey | undefined> {
+    const [key] = await db.update(providerKeys).set(data).where(eq(providerKeys.id, id)).returning();
+    return key;
+  }
+
+  async deleteProviderKey(id: number): Promise<void> {
+    await db.delete(providerKeys).where(eq(providerKeys.id, id));
   }
 
   // Model operations

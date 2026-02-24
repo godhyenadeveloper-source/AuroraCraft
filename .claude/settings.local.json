@@ -25,7 +25,11 @@
       "Bash(npx tsc --noEmit 2>&1; echo \"EXIT_CODE: $?\")",
       "Bash(npm run db:push 2>&1)",
       "Bash(npx tsc --noEmit 2>&1; echo \"EXIT: $?\")",
-      "Bash(npx tsc --noEmit 2>&1; echo \"Exit code: $?\")"
+      "Bash(npx tsc --noEmit 2>&1; echo \"Exit code: $?\")",
+      "Bash(cat server/logs/*.log 2>/dev/null || journalctl -u auroracraft 2>/dev/null | tail -50 || pm2 logs --nostream 2>/dev/null | tail -50 || echo \"no log files found\")",
+      "Bash(node -e \"require\\('dotenv'\\).config\\(\\); console.log\\(process.env.DATABASE_URL ? 'DB URL found' : 'no DB URL'\\)\" 2>&1)",
+      "Bash(cat .env 2>/dev/null | grep DATABASE_URL || grep -r DATABASE_URL .env* 2>/dev/null || echo \"no .env\")",
+      "Bash(DATABASE_URL=postgresql://aurora:aurorapass@localhost:5432/auroracraft npm run db:push 2>&1)"
     ]
   }
 }
