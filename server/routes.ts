@@ -48,15 +48,15 @@ function computeTokenUsageFromChars(
     typeof model.inputCostPerKChar === "number" && model.inputCostPerKChar > 0
       ? model.inputCostPerKChar
       : typeof model.tokenCostPerChar === "number"
-      ? model.tokenCostPerChar
-      : 0;
+        ? model.tokenCostPerChar
+        : 0;
 
   const outputRate =
     typeof model.outputCostPerKChar === "number" && model.outputCostPerKChar > 0
       ? model.outputCostPerKChar
       : typeof model.tokenCostPerChar === "number"
-      ? model.tokenCostPerChar
-      : 0;
+        ? model.tokenCostPerChar
+        : 0;
 
   const safeInputChars = Number.isFinite(inputChars) && inputChars > 0 ? inputChars : 0;
   const safeOutputChars = Number.isFinite(outputChars) && outputChars > 0 ? outputChars : 0;
@@ -201,7 +201,7 @@ export async function registerRoutes(
         return res.status(404).json({ message: "Session not found" });
       }
 
-      const { role, content, modelId, tokensUsed } = req.body;
+      const { role, content, modelId, tokensUsed, thinkingData } = req.body;
 
       if (!role || !content || typeof content !== "string") {
         return res.status(400).json({ message: "role and content are required" });
@@ -217,6 +217,7 @@ export async function registerRoutes(
         content,
         modelId: modelId || null,
         tokensUsed: typeof tokensUsed === "number" ? tokensUsed : 0,
+        thinkingData: thinkingData || null,
       });
 
       res.json(message);
@@ -387,7 +388,7 @@ export async function registerRoutes(
             tags: ["preference"],
           });
         }
-      } catch {}
+      } catch { }
 
       // Auto-write project architecture instructions
       try {
@@ -401,7 +402,7 @@ export async function registerRoutes(
             tags: ["user-instruction"],
           });
         }
-      } catch {}
+      } catch { }
 
       res.json(assistantMessage);
     } catch (error) {
@@ -438,6 +439,7 @@ export async function registerRoutes(
       let fullResponse = "";
       let tokensUsed = 0;
       let modelForUsage: any | undefined;
+      let thinkingCtxForMessage: any = null;
 
       if (modelId) {
         const model = await storage.getModel(modelId);
@@ -493,9 +495,10 @@ export async function registerRoutes(
                   const { thinking: streamThinkContent, output: cleanResponse } = parseThinking(fullResponse);
                   if (streamThinkContent) {
                     const thinkCtx = resolveThinkingContext(streamChatThinking.typeId, streamChatThinking.level);
+                    thinkingCtxForMessage = { ...thinkCtx, content: streamThinkContent };
                     res.write(`data: ${JSON.stringify({
                       type: "thinking-data",
-                      context: { ...thinkCtx, content: streamThinkContent },
+                      context: thinkingCtxForMessage,
                     })}\n\n`);
                   }
                   fullResponse = cleanResponse;
@@ -525,13 +528,14 @@ export async function registerRoutes(
         tokensUsed = computeTokenUsageFromChars(modelForUsage, inputChars, outputChars);
       }
 
-      // Save assistant message
+      // Save assistant message with thinking data
       const assistantMessage = await storage.createMessage({
         sessionId: session.id,
         role: "assistant",
         content: fullResponse,
         modelId: modelId || null,
         tokensUsed,
+        thinkingData: thinkingCtxForMessage,
       });
 
       // Deduct tokens from user
@@ -568,7 +572,7 @@ export async function registerRoutes(
             tags: ["preference"],
           });
         }
-      } catch {}
+      } catch { }
 
       // Auto-write project architecture instructions
       try {
@@ -582,7 +586,7 @@ export async function registerRoutes(
             tags: ["user-instruction"],
           });
         }
-      } catch {}
+      } catch { }
 
       // Send completion event
       res.write(`data: ${JSON.stringify({ type: "done", messageId: assistantMessage.id, tokensUsed })}\n\n`);
@@ -1650,7 +1654,7 @@ export async function registerRoutes(
                   if (data.candidates?.[0]?.finishReason) {
                     finishReason = data.candidates[0].finishReason;
                   }
-                } catch {}
+                } catch { }
               }
             }
 

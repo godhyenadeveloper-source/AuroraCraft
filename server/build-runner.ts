@@ -97,6 +97,7 @@ export class BuildRunner {
   private abortController = new AbortController();
   private fileMemory = new Map<string, string>();
   private fileIdMap = new Map<string, number>();
+  private preExistingPaths = new Set<string>();
   private modelId: number = 0;
   private sessionId: number = 0;
   private userId: string = "";
@@ -104,6 +105,8 @@ export class BuildRunner {
   private memoryContext: string = "";
   private plan: BuildPlan | null = null;
   private phases: PhaseState[] = [];
+  private thinkingBlocks: ThinkingContext[] = [];
+  private eventIdCounter: number = 0;
 
   // Promise + resolver for awaiting user approval
   private approvalResolve: ((result: { action: string; editInstructions?: string }) => void) | null = null;
@@ -146,7 +149,12 @@ export class BuildRunner {
       phases: this.phases,
       status: "building",
       pendingFileError: this.pendingFileError,
+      thinkingBlocks: this.thinkingBlocks,
     };
+  }
+
+  private nextEventId(): string {
+    return `srv-${this.buildId}-${this.eventIdCounter++}`;
   }
 
   async start(buildId: number): Promise<void> {
@@ -264,14 +272,20 @@ export class BuildRunner {
     const planPrompt = buildPlanningPrompt(userRequest, this.framework, existingFilesForPlanning, planThinking, memoryCtx);
     const planRawFull = await this.callAI(planPrompt, userRequest);
     const { thinking: planThinkingContent, output: planRaw } = parseThinking(planRawFull);
-    if (planThinkingContent) {
-      this.emit({ type: "thinking-block", context: { ...resolveThinkingContext(planThinking.typeId, planThinking.level), content: planThinkingContent } });
-    }
+    // Defer emitting thinking block until we know the response type (Bug 6 fix)
 
     const planJson = this.parseAIPlanJSON(planRaw);
 
     // Handle conversation response
     if (planJson.type === "conversation") {
+      // Bug 6 fix: Reclassify thinking type for conversation responses
+      if (planThinkingContent) {
+        const correctThinking = classifyThinkingType("conversation", { userRequest });
+        const correctCtx = resolveThinkingContext(correctThinking.typeId, correctThinking.level);
+        const thinkBlock: ThinkingContext = { ...correctCtx, content: planThinkingContent };
+        this.thinkingBlocks.push(thinkBlock);
+        this.emit({ type: "thinking-block", context: thinkBlock, eventId: this.nextEventId() } as any);
+      }
       await storage.createMessage({
         sessionId: this.sessionId,
         role: "assistant",
@@ -281,6 +295,13 @@ export class BuildRunner {
       this.emit({ type: "conversation-response", content: planJson.response });
       await this.updateBuildState({ status: "complete" });
       return;
+    }
+
+    // Emit plan-building thinking block for actual build/quick-change responses
+    if (planThinkingContent) {
+      const thinkBlock: ThinkingContext = { ...resolveThinkingContext(planThinking.typeId, planThinking.level), content: planThinkingContent };
+      this.thinkingBlocks.push(thinkBlock);
+      this.emit({ type: "thinking-block", context: thinkBlock, eventId: this.nextEventId() } as any);
     }
 
     // Handle quick-change — agentic loop: AI dynamically decides what to read/update/create/delete
@@ -321,7 +342,7 @@ export class BuildRunner {
         const stepRawFull = await this.callAI(stepPrompt, "Decide the next action.");
         const { thinking: stepThinkContent, output: stepRawClean } = parseThinking(stepRawFull);
         if (stepThinkContent) {
-          this.emit({ type: "thinking-block", context: { ...resolveThinkingContext(stepThinking.typeId, stepThinking.level), content: stepThinkContent } });
+          this.emitThinkingBlock(stepThinking.typeId, stepThinking.level, stepThinkContent);
         }
         let stepJson: any;
         try {
@@ -388,7 +409,7 @@ export class BuildRunner {
             const analysisRawFull = await this.callAI(readPrompt, `Analyze ${actionPath}`);
             const { thinking: readThinkContent, output: analysisRaw } = parseThinking(analysisRawFull);
             if (readThinkContent) {
-              this.emit({ type: "thinking-block", context: { ...resolveThinkingContext(readThinking.typeId, readThinking.level), content: readThinkContent } });
+              this.emitThinkingBlock(readThinking.typeId, readThinking.level, readThinkContent);
             }
             let summaryText: string;
             try {
@@ -419,7 +440,7 @@ export class BuildRunner {
             const patchRawFull = await this.callAI(patchPrompt, `Apply this change: ${actionReason}`);
             const { thinking: patchThinkContent, output: updatedContent } = parseThinking(patchRawFull);
             if (patchThinkContent) {
-              this.emit({ type: "thinking-block", context: { ...resolveThinkingContext(patchThinking.typeId, patchThinking.level), content: patchThinkContent } });
+              this.emitThinkingBlock(patchThinking.typeId, patchThinking.level, patchThinkContent);
             }
             await this.writeFile(actionPath, fileName, updatedContent);
             this.phases[0].files[fileIdx].status = "updated";
@@ -443,7 +464,7 @@ export class BuildRunner {
           const createRawFull = await this.callAI(genPrompt, `Generate ${actionPath}`);
           const { thinking: createThinkContent, output: content } = parseThinking(createRawFull);
           if (createThinkContent) {
-            this.emit({ type: "thinking-block", context: { ...resolveThinkingContext(createThinking.typeId, createThinking.level), content: createThinkContent } });
+            this.emitThinkingBlock(createThinking.typeId, createThinking.level, createThinkContent);
           }
           await this.writeFile(actionPath, fileName, content);
           fileTree.push(actionPath);
@@ -561,23 +582,39 @@ export class BuildRunner {
     }
 
     if (result.action === "edit" && result.editInstructions) {
-      // Re-plan with modifications
+      // Re-plan with modifications (Bug 3 fix: retry up to 2 times)
       this.emit({ type: "thinking", message: "Revising plan..." });
       const reviseThinking = classifyThinkingType("planning", { userRequest: userRequest + result.editInstructions });
-      const revisedRawFull = await this.callAI(
-        buildPlanningPrompt(
-          `${userRequest}\n\nIMPORTANT MODIFICATIONS: ${result.editInstructions}`,
-          this.framework,
-          existingFilesForPlanning,
-          reviseThinking,
-        ),
-        "Revise the build plan with these modifications.",
-      );
-      const { thinking: reviseThinkContent, output: revisedRaw } = parseThinking(revisedRawFull);
-      if (reviseThinkContent) {
-        this.emit({ type: "thinking-block", context: { ...resolveThinkingContext(reviseThinking.typeId, reviseThinking.level), content: reviseThinkContent } });
+      let revisedParsed: any = null;
+      let reviseError: Error | null = null;
+      for (let reviseAttempt = 0; reviseAttempt < 3; reviseAttempt++) {
+        try {
+          const revisedRawFull = await this.callAI(
+            buildPlanningPrompt(
+              `${userRequest}\n\nIMPORTANT MODIFICATIONS: ${result.editInstructions}`,
+              this.framework,
+              existingFilesForPlanning,
+              reviseThinking,
+              this.memoryContext,
+            ),
+            "Revise the build plan with these modifications.",
+          );
+          const { thinking: reviseThinkContent, output: revisedRaw } = parseThinking(revisedRawFull);
+          if (reviseThinkContent) {
+            this.emitThinkingBlock(reviseThinking.typeId, reviseThinking.level, reviseThinkContent);
+          }
+          revisedParsed = this.parseAIPlanJSON(revisedRaw);
+          break; // Parse succeeded
+        } catch (e: any) {
+          reviseError = e;
+          if (reviseAttempt < 2) continue; // Retry
+        }
       }
-      const revisedParsed = this.parseAIPlanJSON(revisedRaw);
+      if (!revisedParsed) {
+        this.emit({ type: "build-error", error: "Plan revision failed — could not parse revised plan. Please try again." });
+        await this.updateBuildState({ status: "error", error: "Plan revision failed" });
+        return;
+      }
       if (revisedParsed?.type === "build" || revisedParsed?.phases) {
         this.plan = {
           pluginName: revisedParsed.pluginName || plan.pluginName,
@@ -605,7 +642,18 @@ export class BuildRunner {
           })),
         }));
         this.emit({ type: "plan-ready", plan: this.plan });
-        await this.updateBuildState({ plan: this.plan, phases: this.phases });
+        await this.updateBuildState({ plan: this.plan, phases: this.phases, status: "awaiting-approval" });
+
+        // Wait for re-approval after revision
+        const reApproval = await new Promise<{ action: string; editInstructions?: string }>((resolve) => {
+          this.approvalResolve = resolve;
+        });
+        if (reApproval.action === "cancel") {
+          this.emit({ type: "build-error", error: "Plan was cancelled by user." });
+          await this.updateBuildState({ status: "cancelled" });
+          return;
+        }
+        // If edit again, we fall through to the plan-approved below (simplified — subsequent edits not supported here)
       }
     }
 
@@ -636,12 +684,13 @@ export class BuildRunner {
 
       // File reading — ask AI which existing files to read for context
       let dynamicIdx = phase.files.length;
-      if (this.fileMemory.size > 0) {
+      // Bug 4 fix: Only offer pre-existing files (not build-created files) for context reading
+      if (this.preExistingPaths.size > 0) {
         try {
           this.emit({ type: "thinking", message: "Analyzing dependencies..." });
           await this.updateBuildState({ thinkingMessage: "Analyzing dependencies..." });
 
-          const existingPaths = Array.from(this.fileMemory.keys());
+          const existingPaths = Array.from(this.preExistingPaths);
           const phaseFileNames = phase.files.map((f) => `- ${f.path}: ${f.description}`).join("\n");
           const readCheckPrompt = `You are AuroraCraft. For this build phase, determine which existing project files need to be read for context.
 
@@ -665,6 +714,9 @@ No text before or after the JSON.`;
             filesToRead = [];
           }
 
+          // Bug 4: Filter out files that exist in fileMemory but were NOT pre-existing
+          filesToRead = filesToRead.filter(p => this.preExistingPaths.has(p));
+
           for (const readPath of filesToRead) {
             if (signal.aborted) throw new Error("Build cancelled");
             const content = this.fileMemory.get(readPath);
@@ -683,7 +735,7 @@ No text before or after the JSON.`;
             const readRawFull = await this.callAI(readPrompt, `Analyze ${readPath}`);
             const { thinking: phaseReadThinkContent } = parseThinking(readRawFull);
             if (phaseReadThinkContent) {
-              this.emit({ type: "thinking-block", context: { ...resolveThinkingContext(phaseReadThinking.typeId, phaseReadThinking.level), content: phaseReadThinkContent } });
+              this.emitThinkingBlock(phaseReadThinking.typeId, phaseReadThinking.level, phaseReadThinkContent);
             }
 
             this.phases[phaseIdx].files[readIdx].status = "read";
@@ -729,7 +781,7 @@ No text before or after the JSON.`;
           const fileRawFull = await this.callAI(filePrompt, `Generate ${file.path}`);
           const { thinking: fileThinkContent, output: fileContent } = parseThinking(fileRawFull);
           if (fileThinkContent) {
-            this.emit({ type: "thinking-block", context: { ...resolveThinkingContext(fileGenThinking.typeId, fileGenThinking.level), content: fileThinkContent } });
+            this.emitThinkingBlock(fileGenThinking.typeId, fileGenThinking.level, fileThinkContent);
           }
           await this.writeFile(file.path, file.name, fileContent);
 
@@ -785,7 +837,7 @@ No text before or after the JSON.`;
           const reviewRawFull = await this.callAI(reviewPrompt, "Review these files.");
           const { thinking: reviewThinkContent, output: reviewRaw } = parseThinking(reviewRawFull);
           if (reviewThinkContent) {
-            this.emit({ type: "thinking-block", context: { ...resolveThinkingContext(reviewThinking.typeId, reviewThinking.level), content: reviewThinkContent } });
+            this.emitThinkingBlock(reviewThinking.typeId, reviewThinking.level, reviewThinkContent);
           }
 
           let reviewResult: any;
@@ -844,7 +896,7 @@ No text before or after the JSON.`;
                 const fixRawFull = await this.callAI(fixPrompt, `Fix ${fixFile.path}: ${fix.reason}`);
                 const { thinking: fixThinkContent, output: fixedContent } = parseThinking(fixRawFull);
                 if (fixThinkContent) {
-                  this.emit({ type: "thinking-block", context: { ...resolveThinkingContext(fixThinking.typeId, fixThinking.level), content: fixThinkContent } });
+                  this.emitThinkingBlock(fixThinking.typeId, fixThinking.level, fixThinkContent);
                 }
                 await this.writeFile(fixFile.path, fixFile.name, fixedContent);
                 this.phases[fixPhaseIdx].files[fixFileIdx] = { ...this.phases[fixPhaseIdx].files[fixFileIdx], status: "updated" };
@@ -917,7 +969,7 @@ No text before or after the JSON.`;
     const summaryRawFull = await this.callAI(summaryPrompt, "Generate the build completion summary.");
     const { thinking: summaryThinkContent, output: summary } = parseThinking(summaryRawFull);
     if (summaryThinkContent) {
-      this.emit({ type: "thinking-block", context: { ...resolveThinkingContext(summaryThinking.typeId, summaryThinking.level), content: summaryThinkContent } });
+      this.emitThinkingBlock(summaryThinking.typeId, summaryThinking.level, summaryThinkContent);
     }
 
     await storage.createMessage({
@@ -1017,6 +1069,7 @@ No text before or after the JSON.`;
         if (!f.isFolder && f.content) {
           this.fileMemory.set(f.path, f.content);
           this.fileIdMap.set(f.path, f.id);
+          this.preExistingPaths.add(f.path); // Bug 4: Track pre-existing files
         }
       }
     } catch {}
@@ -1027,6 +1080,10 @@ No text before or after the JSON.`;
     if (this.fileMemory.size > 0) {
       updates.fileMemory = Object.fromEntries(this.fileMemory);
     }
+    // Bug 1: Persist thinking blocks to DB
+    if (this.thinkingBlocks.length > 0) {
+      updates.thinkingBlocks = this.thinkingBlocks;
+    }
     try {
       await storage.updateBuild(this.buildId, updates);
     } catch (e) {
@@ -1036,6 +1093,13 @@ No text before or after the JSON.`;
 
   private emit(event: BuildEvent): void {
     this.emitter.emit("event", event);
+  }
+
+  /** Helper: emit a thinking-block event and accumulate it for persistence */
+  private emitThinkingBlock(typeId: string, level: number, content: string): void {
+    const ctx: ThinkingContext = { ...resolveThinkingContext(typeId, level), content };
+    this.thinkingBlocks.push(ctx);
+    this.emit({ type: "thinking-block", context: ctx, eventId: this.nextEventId() } as any);
   }
 
   private buildProjectContext(currentPhasePaths?: string[]): string {

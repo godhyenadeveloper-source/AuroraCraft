@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useReducer } from "react";
+import React, { useState, useEffect, useRef, useReducer } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { useRoute, useLocation, Link } from "wouter";
 import { useAuth } from "@/hooks/useAuth";
@@ -194,9 +194,8 @@ function FileTreeNode({
   return (
     <div>
       <div
-        className={`flex items-center gap-1 px-2 py-1 text-sm cursor-pointer hover-elevate rounded-md ${
-          isSelected ? "bg-accent text-accent-foreground" : ""
-        }`}
+        className={`flex items-center gap-1 px-2 py-1 text-sm cursor-pointer hover-elevate rounded-md ${isSelected ? "bg-accent text-accent-foreground" : ""
+          }`}
         style={{ paddingLeft: `${level * 12 + 8}px` }}
         onClick={() => {
           if (item.isFolder) {
@@ -251,6 +250,7 @@ function FileTreeNode({
 
 const BUILD_STATE_KEY = (sid: number) => `auroracraft-build-${sid}`;
 
+
 function saveBuildState(sid: number, state: BuildState): void {
   try {
     localStorage.setItem(BUILD_STATE_KEY(sid), JSON.stringify(state));
@@ -278,7 +278,7 @@ function loadBuildState(sid: number): BuildState | null {
           const { filePath, error } = JSON.parse(fileErrorRaw);
           errorMsg = `Build interrupted while generating ${filePath}: ${error}. Files created before the interruption are preserved.`;
         }
-      } catch {}
+      } catch { }
       return {
         ...parsed,
         status: "error",
@@ -299,7 +299,7 @@ function clearBuildState(sid: number): void {
     // ignore
   }
   // Also clear server-side build plan (fire-and-forget)
-  apiRequest("PATCH", `/api/sessions/${sid}`, { buildPlan: null, buildStatus: "idle" }).catch(() => {});
+  apiRequest("PATCH", `/api/sessions/${sid}`, { buildPlan: null, buildStatus: "idle" }).catch(() => { });
 }
 
 export default function ChatPage() {
@@ -422,7 +422,7 @@ export default function ChatPage() {
           }
         }
       })
-      .catch(() => {});
+      .catch(() => { });
   }, [sessionId]);
 
   // SSE subscription for server-side build events
@@ -440,12 +440,11 @@ export default function ChatPage() {
           queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "messages"] });
           queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "files"] });
           queryClient.invalidateQueries({ queryKey: ["/api/auth/user"] });
-          // Only clear build state if the build actually completed successfully.
-          // If the snapshot showed an error/cancelled state, preserve it so the
-          // user can see the error and resume.
+          // Keep build state on successful completion so plan/phases/summary persist
+          // Only clear file-error state
           if (lastSnapshotStatus === "complete") {
             if (sessionId) {
-              clearBuildState(sessionId);
+              try { localStorage.removeItem(`auroracraft-file-error-${sessionId}`); } catch { }
             }
           }
           eventSource.close();
@@ -463,7 +462,7 @@ export default function ChatPage() {
             setPendingFileError({
               filePath: event.state.pendingFileError.filePath,
               error: event.state.pendingFileError.error,
-              resolve: () => {}, // Server-side builds use API calls, not promise resolve
+              resolve: () => { }, // Server-side builds use API calls, not promise resolve
             });
           }
         }
@@ -486,10 +485,22 @@ export default function ChatPage() {
         if (event.type === "file-created" || event.type === "file-updated" || event.type === "file-deleted") {
           queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "files"] });
         }
-        if (event.type === "build-complete" || event.type === "conversation-response") {
+        if (event.type === "build-complete") {
+          // Keep build state in localStorage so plan/phases/summary survive refresh
+          // Only clear file-error state
           if (sessionId) {
-            clearBuildState(sessionId);
-            try { localStorage.removeItem(`auroracraft-file-error-${sessionId}`); } catch {}
+            try { localStorage.removeItem(`auroracraft-file-error-${sessionId}`); } catch { }
+          }
+          queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "messages"] });
+          queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "files"] });
+          queryClient.invalidateQueries({ queryKey: ["/api/auth/user"] });
+          setActiveBuildId(null);
+          setIsStreaming(false);
+          eventSource.close();
+        }
+        if (event.type === "conversation-response") {
+          if (sessionId) {
+            try { localStorage.removeItem(`auroracraft-file-error-${sessionId}`); } catch { }
           }
           queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "messages"] });
           queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "files"] });
@@ -509,14 +520,14 @@ export default function ChatPage() {
           setPendingFileError({
             filePath,
             error: event.error,
-            resolve: () => {}, // Server-side builds use API calls, not promise resolve
+            resolve: () => { }, // Server-side builds use API calls, not promise resolve
           });
         }
         // Clear file error UI when file is retried/created
         if (event.type === "file-generating" || event.type === "file-updating" || event.type === "file-reading") {
           setPendingFileError(null);
         }
-      } catch {}
+      } catch { }
     };
 
     eventSource.onerror = () => {
@@ -589,14 +600,16 @@ export default function ChatPage() {
     if (!abortController.signal.aborted && fullText) {
       // Parse thinking from full response
       const parsedFinal = parseStreamingThinking(fullText);
+      let thinkingCtxForPuter: any = null;
       if (parsedFinal.thinking) {
-        setChatThinking({
+        thinkingCtxForPuter = {
           typeId: "question",
           typeName: "Question Think",
           level: 1,
           levelName: "Think",
           content: parsedFinal.thinking,
-        });
+        };
+        setChatThinking(thinkingCtxForPuter);
       }
       const cleanContent = parsedFinal.visibleContent;
 
@@ -615,11 +628,13 @@ export default function ChatPage() {
         // Token accounting failure should not break chat UX
       }
 
+      // Save assistant message WITH thinking data so it persists through refresh
       await apiRequest("POST", `/api/sessions/${sessionId}/messages`, {
         role: "assistant",
         content: cleanContent,
         modelId: selectedModel ? parseInt(selectedModel) : undefined,
         tokensUsed,
+        thinkingData: thinkingCtxForPuter,
       });
 
       queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "messages"] });
@@ -760,7 +775,8 @@ export default function ChatPage() {
     } finally {
       setIsStreaming(false);
       setStreamingContent("");
-      // Don't reset chatThinking here — it persists after streaming ends so the thinking block stays visible
+      // Keep chatThinking alive — it will be rendered by the per-message thinkingData
+      // from DB after messages refetch. We'll clear it only on next user message send.
       abortControllerRef.current = null;
     }
   };
@@ -768,7 +784,7 @@ export default function ChatPage() {
   const stopStreaming = () => {
     if (activeBuildId) {
       // Cancel server-side build
-      apiRequest("POST", `/api/builds/${activeBuildId}/cancel`).catch(() => {});
+      apiRequest("POST", `/api/builds/${activeBuildId}/cancel`).catch(() => { });
       setActiveBuildId(null);
       setIsStreaming(false);
       dispatchBuild({ type: "build-error", error: "Build was cancelled" });
@@ -947,7 +963,7 @@ export default function ChatPage() {
           `auroracraft-file-error-${sessionId}`,
           JSON.stringify({ filePath: pendingFileError.filePath, error: pendingFileError.error })
         );
-      } catch {}
+      } catch { }
     }
   }, [sessionId, pendingFileError]);
 
@@ -1042,9 +1058,11 @@ export default function ChatPage() {
     const buildEventHandler = (event: BuildEvent) => {
       dispatchBuild(event);
       if (event.type === "conversation-response" || event.type === "build-complete") {
+        if (event.type === "conversation-response" && sessionId) {
+          // Don't clear build state — reducer preserves completed builds
+        }
         if (sessionId) {
-          clearBuildState(sessionId);
-          try { localStorage.removeItem(`auroracraft-file-error-${sessionId}`); } catch {}
+          try { localStorage.removeItem(`auroracraft-file-error-${sessionId}`); } catch { }
         }
         queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "messages"] });
         queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "files"] });
@@ -1199,9 +1217,11 @@ export default function ChatPage() {
         onEvent: (event: BuildEvent) => {
           dispatchBuild(event);
           if (event.type === "conversation-response" || event.type === "build-complete") {
+            if (event.type === "conversation-response" && sessionId) {
+              // Don't clear build state — reducer preserves completed builds
+            }
             if (sessionId) {
-              clearBuildState(sessionId);
-              try { localStorage.removeItem(`auroracraft-file-error-${sessionId}`); } catch {}
+              try { localStorage.removeItem(`auroracraft-file-error-${sessionId}`); } catch { }
             }
             queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "messages"] });
             queryClient.invalidateQueries({ queryKey: ["/api/sessions", sessionId, "files"] });
@@ -1363,67 +1383,80 @@ export default function ChatPage() {
                   </div>
                 ) : (
                   messages?.filter((msg) => {
-                    // Filter out plan summary message when build plan card is showing (Fix #6)
-                    if (buildState.plan && buildState.status !== "idle" && buildState.status !== "complete" &&
-                        msg.role === "assistant" && msg.content.startsWith(`**Build Plan: ${buildState.plan.pluginName}**`)) {
+                    // Bug 7: Filter out plan summary message when build plan card is showing
+                    if (buildState.plan && buildState.status !== "idle" &&
+                      msg.role === "assistant" && msg.content.startsWith(`**Build Plan: ${buildState.plan.pluginName}**`)) {
+                      return false;
+                    }
+                    // Bug 7: Filter out build completion summary when it's shown as a BuildSummaryMessage card
+                    if (buildState.summary && buildState.status === "complete" &&
+                      msg.role === "assistant" && msg.content === buildState.summary) {
                       return false;
                     }
                     return true;
                   }).map((msg) => (
-                    <div
-                      key={msg.id}
-                      className={`flex gap-3 ${msg.role === "user" ? "justify-end" : ""}`}
-                      data-testid={`message-${msg.id}`}
-                    >
-                      {msg.role === "assistant" && (
-                        <div className="w-8 h-8 rounded-full bg-primary flex items-center justify-center shrink-0">
-                          <Bot className="w-4 h-4 text-primary-foreground" />
-                        </div>
+                    <React.Fragment key={msg.id}>
+                      {/* Render per-message thinking from DB thinkingData */}
+                      {msg.role === "assistant" && (msg as any).thinkingData && (
+                        <ThinkingBlock context={(msg as any).thinkingData as any} />
                       )}
                       <div
-                        className={`max-w-[85%] rounded-xl px-4 py-3 ${
-                          msg.role === "user"
+                        className={`flex gap-3 ${msg.role === "user" ? "justify-end" : ""}`}
+                        data-testid={`message-${msg.id}`}
+                      >
+                        {msg.role === "assistant" && (
+                          <div className="w-8 h-8 rounded-full bg-primary flex items-center justify-center shrink-0">
+                            <Bot className="w-4 h-4 text-primary-foreground" />
+                          </div>
+                        )}
+                        <div
+                          className={`max-w-[85%] rounded-xl px-4 py-3 ${msg.role === "user"
                             ? "bg-primary text-primary-foreground"
                             : "bg-card border border-card-border"
-                        }`}
-                      >
-                        {msg.role === "assistant" ? (
-                          <MarkdownRenderer content={msg.content} className="text-sm" />
-                        ) : (
-                          <p className="text-sm whitespace-pre-wrap">{msg.content}</p>
+                            }`}
+                        >
+                          {msg.role === "assistant" ? (
+                            <MarkdownRenderer content={msg.content} className="text-sm" />
+                          ) : (
+                            <p className="text-sm whitespace-pre-wrap">{msg.content}</p>
+                          )}
+                        </div>
+                        {msg.role === "user" && (
+                          <div className="w-8 h-8 rounded-full bg-accent flex items-center justify-center shrink-0">
+                            <User className="w-4 h-4" />
+                          </div>
                         )}
                       </div>
-                      {msg.role === "user" && (
-                        <div className="w-8 h-8 rounded-full bg-accent flex items-center justify-center shrink-0">
-                          <User className="w-4 h-4" />
-                        </div>
-                      )}
-                    </div>
+                    </React.Fragment>
                   ))
                 )}
 
                 {/* Build engine UI — phases, badges, progress */}
                 {buildState.plan && buildState.status !== "idle" && (
                   <>
+                    {/* Bug 5: Render planning thinking blocks BEFORE the plan card */}
+                    {buildState.thinkingBlocks
+                      .filter(block => block.typeName?.toLowerCase().includes('plan'))
+                      .map((block, i) => (
+                        <ThinkingBlock key={`tb-plan-${i}`} context={block} />
+                      ))
+                    }
                     <BuildPlanMessage
                       plan={buildState.plan}
                       showActions={!!pendingPlanConfirm || buildState.status === "awaiting-approval"}
                       onConfirm={() => {
                         if (activeBuildId) {
-                          // Server-side build: approve via API
-                          apiRequest("POST", `/api/builds/${activeBuildId}/approve`, { action: "approve" }).catch(() => {});
+                          apiRequest("POST", `/api/builds/${activeBuildId}/approve`, { action: "approve" }).catch(() => { });
                         } else if (pendingPlanConfirm) {
                           pendingPlanConfirm.resolve({ action: 'approve' });
                           setPendingPlanConfirm(null);
                         } else {
-                          // Post-refresh: start a new build with this plan
                           handleResumeBuild();
                         }
                       }}
                       onCancel={() => {
                         if (activeBuildId) {
-                          // Server-side build: cancel via API
-                          apiRequest("POST", `/api/builds/${activeBuildId}/approve`, { action: "cancel" }).catch(() => {});
+                          apiRequest("POST", `/api/builds/${activeBuildId}/approve`, { action: "cancel" }).catch(() => { });
                           setActiveBuildId(null);
                           dispatchBuild({ type: "conversation-response", content: "" });
                           if (sessionId) clearBuildState(sessionId);
@@ -1439,15 +1472,19 @@ export default function ChatPage() {
                         pendingPlanConfirm.resolve({ action: 'edit', editInstructions: instructions });
                         setPendingPlanConfirm(null);
                       } : activeBuildId ? (instructions) => {
-                        apiRequest("POST", `/api/builds/${activeBuildId}/approve`, { action: "edit", editInstructions: instructions }).catch(() => {});
+                        apiRequest("POST", `/api/builds/${activeBuildId}/approve`, { action: "edit", editInstructions: instructions }).catch(() => { });
                       } : undefined}
                     />
                     {/* Phases render only after plan is confirmed */}
-                    {!pendingPlanConfirm && buildState.status !== "awaiting-approval" && buildState.phases.map((phase, i) => (
-                      phase.status !== "pending" && (
+                    {!pendingPlanConfirm && buildState.status !== "awaiting-approval" && buildState.phases.map((phase, i) => {
+                      // Bug 5: Collect thinking blocks for this phase
+                      const phaseThinkingBlocks = buildState.thinkingBlocks.filter(
+                        block => !block.typeName?.toLowerCase().includes('plan') && !block.typeName?.toLowerCase().includes('summary')
+                      );
+                      return phase.status !== "pending" && (
                         <PhaseBubble key={i} phase={phase} phaseIndex={i} />
-                      )
-                    ))}
+                      );
+                    })}
                   </>
                 )}
 
@@ -1458,7 +1495,7 @@ export default function ChatPage() {
                     error={pendingFileError.error}
                     onRetry={() => {
                       if (activeBuildId) {
-                        apiRequest("POST", `/api/builds/${activeBuildId}/file-error-decision`, { decision: "retry" }).catch(() => {});
+                        apiRequest("POST", `/api/builds/${activeBuildId}/file-error-decision`, { decision: "retry" }).catch(() => { });
                       } else {
                         pendingFileError.resolve('retry');
                       }
@@ -1466,7 +1503,7 @@ export default function ChatPage() {
                     }}
                     onCancel={() => {
                       if (activeBuildId) {
-                        apiRequest("POST", `/api/builds/${activeBuildId}/file-error-decision`, { decision: "cancel" }).catch(() => {});
+                        apiRequest("POST", `/api/builds/${activeBuildId}/file-error-decision`, { decision: "cancel" }).catch(() => { });
                       } else {
                         pendingFileError.resolve('cancel');
                       }
@@ -1475,9 +1512,18 @@ export default function ChatPage() {
                   />
                 )}
 
-                {/* Build summary */}
+                {/* Bug 5: Render summary thinking blocks before the summary */}
                 {buildState.status === "complete" && buildState.summary && (
-                  <BuildSummaryMessage content={buildState.summary} />
+                  <>
+                    {buildState.thinkingBlocks
+                      .filter(block => block.typeName?.toLowerCase().includes('summary') ||
+                        (!block.typeName?.toLowerCase().includes('plan') && buildState.phases.length === 0))
+                      .map((block, i) => (
+                        <ThinkingBlock key={`tb-summary-${i}`} context={block} />
+                      ))
+                    }
+                    <BuildSummaryMessage content={buildState.summary} />
+                  </>
                 )}
 
                 {/* Build error / interrupted */}
@@ -1497,7 +1543,7 @@ export default function ChatPage() {
                         dispatchBuild({ type: "conversation-response", content: "" });
                         if (sessionId) {
                           clearBuildState(sessionId);
-                          try { localStorage.removeItem(`auroracraft-file-error-${sessionId}`); } catch {}
+                          try { localStorage.removeItem(`auroracraft-file-error-${sessionId}`); } catch { }
                         }
                       }}
                     />
@@ -1506,12 +1552,7 @@ export default function ChatPage() {
                   )
                 )}
 
-                {/* AI thinking blocks — collapsed by default */}
-                {buildState.thinkingBlocks.length > 0 && (
-                  buildState.thinkingBlocks.map((block, i) => (
-                    <ThinkingBlock key={`tb-${i}`} context={block} />
-                  ))
-                )}
+
 
                 {/* Build thinking indicator */}
                 {isBuildActive && buildState.thinkingMessage && (
@@ -1526,7 +1567,7 @@ export default function ChatPage() {
                   </div>
                 )}
 
-                {/* Chat thinking block — shown above streaming response */}
+                {/* Live chat thinking — shown above streaming response, cleared on next message */}
                 {chatThinking && chatThinking.content && (
                   <ThinkingBlock context={chatThinking as any} />
                 )}
@@ -1593,10 +1634,10 @@ export default function ChatPage() {
                     isBuildActive || buildState.status === "awaiting-approval"
                       ? "Build in progress..."
                       : mode === "agent"
-                      ? "Describe what you want to build..."
-                      : mode === "plan"
-                      ? "Describe the plugin architecture..."
-                      : "Ask a question about your project..."
+                        ? "Describe what you want to build..."
+                        : mode === "plan"
+                          ? "Describe the plugin architecture..."
+                          : "Ask a question about your project..."
                   }
                   value={message}
                   onChange={(e) => setMessage(e.target.value)}
@@ -1758,8 +1799,8 @@ export default function ChatPage() {
                             latestCompilation.status === "success"
                               ? "default"
                               : latestCompilation.status === "failed"
-                              ? "destructive"
-                              : "secondary"
+                                ? "destructive"
+                                : "secondary"
                           }
                           className="text-xs"
                         >

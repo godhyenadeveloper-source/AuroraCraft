@@ -60,7 +60,7 @@ export interface FileState {
   name: string;
   description: string;
   status: "pending" | "generating" | "created" | "updating" | "updated"
-        | "reading" | "read" | "deleting" | "deleted" | "error";
+  | "reading" | "read" | "deleting" | "deleted" | "error";
   error?: string;
 }
 
@@ -150,7 +150,11 @@ export function buildReducer(state: BuildState, event: BuildEvent): BuildState {
       return { ...state, status: "building" };
 
     case "conversation-response":
-      return { ...INITIAL_BUILD_STATE, thinkingBlocks: state.thinkingBlocks };
+      // Preserve completed build UI when user sends a follow-up conversation message
+      if (state.plan && state.summary) {
+        return { ...state, status: "complete", thinkingMessage: null, thinkingBlocks: [] };
+      }
+      return INITIAL_BUILD_STATE;
 
     case "quick-change-start":
       return {
@@ -525,6 +529,7 @@ export async function runBuild(params: RunBuildParams): Promise<void> {
     // 2. Planning — fetch existing files first so the AI has full project context
     onEvent({ type: "planning" });
     let existingFilesForPlanning: { path: string; content: string }[] = [];
+    const preExistingPaths = new Set<string>();
     try {
       const efRes = await apiRequest("GET", `/api/sessions/${sessionId}/files`);
       const efList: { id: number; path: string; content: string }[] = await efRes.json();
@@ -534,8 +539,9 @@ export async function runBuild(params: RunBuildParams): Promise<void> {
         }
         fileMemory.set(ef.path, ef.content);
         fileIdMap.set(ef.path, ef.id);
+        preExistingPaths.add(ef.path); // Bug 4: Track pre-existing files
       }
-    } catch {}
+    } catch { }
 
     // Fetch memory context from server
     let memoryCtx = "";
@@ -544,13 +550,13 @@ export async function runBuild(params: RunBuildParams): Promise<void> {
         const res = await apiRequest("GET", `/api/sessions/${sessionId}/memory-context`);
         const data = await res.json();
         memoryCtx = data.context || "";
-      } catch {}
+      } catch { }
     };
     const writeProjectMemory = async (content: string, tags: string[]): Promise<void> => {
-      try { await apiRequest("POST", `/api/sessions/${sessionId}/memories`, { content, tags }); } catch {}
+      try { await apiRequest("POST", `/api/sessions/${sessionId}/memories`, { content, tags }); } catch { }
     };
     const updateFileStructureMap = async (entries: { path: string; description: string }[]): Promise<void> => {
-      try { await apiRequest("POST", `/api/sessions/${sessionId}/file-structure-map`, { fileEntries: entries }); } catch {}
+      try { await apiRequest("POST", `/api/sessions/${sessionId}/file-structure-map`, { fileEntries: entries }); } catch { }
     };
     const getFileEntries = (): { path: string; description: string }[] => {
       return Array.from(fileMemory.keys()).map(path => ({
@@ -563,7 +569,7 @@ export async function runBuild(params: RunBuildParams): Promise<void> {
     const planThinking = classifyThinkingType("planning", { userRequest });
     const planningPrompt = buildPlanningPrompt(
       userRequest, framework,
-      existingFilesForPlanning.length > 0 ? existingFilesForPlanning : undefined,
+      existingFilesForPlanning, // Bug 2: Always pass the array (even if empty) so prompt says "empty project"
       planThinking,
       memoryCtx,
     );
@@ -572,15 +578,19 @@ export async function runBuild(params: RunBuildParams): Promise<void> {
       : userRequest;
     const planRawFull = await callAI(planningPrompt, planningInput);
     const { thinking: planThinkingContent, output: planRaw } = parseThinking(planRawFull);
-    if (planThinkingContent) {
-      onEvent({ type: "thinking-block", context: { ...resolveThinkingContext(planThinking.typeId, planThinking.level), content: planThinkingContent } });
-    }
+    // Bug 6: Defer emitting thinking block until we know the response type
 
     // Parse the JSON plan (strip markdown fences if AI wrapped them)
     const planJson = parseAIPlanJSON(planRaw);
 
     // Handle conversation response (non-build request)
     if (planJson.type === "conversation") {
+      // Bug 6: Reclassify thinking type for conversation responses
+      if (planThinkingContent) {
+        const correctThinking = classifyThinkingType("conversation", { userRequest });
+        const correctCtx = resolveThinkingContext(correctThinking.typeId, correctThinking.level);
+        onEvent({ type: "thinking-block", context: { ...correctCtx, content: planThinkingContent } });
+      }
       await apiRequest("POST", `/api/sessions/${sessionId}/messages`, {
         role: "assistant",
         content: planJson.response,
@@ -588,6 +598,11 @@ export async function runBuild(params: RunBuildParams): Promise<void> {
       });
       onEvent({ type: "conversation-response", content: planJson.response });
       return;
+    }
+
+    // Emit plan-building thinking block for actual build/quick-change responses
+    if (planThinkingContent) {
+      onEvent({ type: "thinking-block", context: { ...resolveThinkingContext(planThinking.typeId, planThinking.level), content: planThinkingContent } });
     }
 
     // Handle quick-change — agentic loop: AI dynamically decides what to read/update/create/delete
@@ -644,9 +659,9 @@ export async function runBuild(params: RunBuildParams): Promise<void> {
         const fileName = actionPath.split("/").pop() || actionPath;
         const badgeStatus: FileState["status"] =
           action === "read" ? "reading" :
-          action === "update" ? "updating" :
-          action === "create" ? "generating" :
-          action === "delete" ? "deleting" : "pending";
+            action === "update" ? "updating" :
+              action === "create" ? "generating" :
+                action === "delete" ? "deleting" : "pending";
         const fileIdx = dynamicFileIndex++;
         onEvent({
           type: "dynamic-file",
@@ -811,20 +826,34 @@ export async function runBuild(params: RunBuildParams): Promise<void> {
         if (result.action === 'edit' && result.editInstructions) {
           onEvent({ type: "thinking", message: "Revising plan..." });
           const reviseThinking = classifyThinkingType("planning", { userRequest: userRequest + result.editInstructions });
-          const revisedPlanRawFull = await callAI(
-            buildPlanningPrompt(
-              `${userRequest}\n\nIMPORTANT MODIFICATIONS: ${result.editInstructions}`,
-              framework,
-              existingFilesForPlanning.length > 0 ? existingFilesForPlanning : undefined,
-              reviseThinking,
-            ),
-            "Revise the build plan with these modifications.",
-          );
-          const { thinking: reviseThinkContent, output: revisedPlanText } = parseThinking(revisedPlanRawFull);
-          if (reviseThinkContent) {
-            onEvent({ type: "thinking-block", context: { ...resolveThinkingContext(reviseThinking.typeId, reviseThinking.level), content: reviseThinkContent } });
+          // Bug 3: Retry up to 3 times
+          let revisedParsed: any = null;
+          for (let reviseAttempt = 0; reviseAttempt < 3; reviseAttempt++) {
+            try {
+              const revisedPlanRawFull = await callAI(
+                buildPlanningPrompt(
+                  `${userRequest}\n\nIMPORTANT MODIFICATIONS: ${result.editInstructions}`,
+                  framework,
+                  existingFilesForPlanning, // Bug 2: Always pass array
+                  reviseThinking,
+                  memoryCtx,
+                ),
+                "Revise the build plan with these modifications.",
+              );
+              const { thinking: reviseThinkContent, output: revisedPlanText } = parseThinking(revisedPlanRawFull);
+              if (reviseThinkContent) {
+                onEvent({ type: "thinking-block", context: { ...resolveThinkingContext(reviseThinking.typeId, reviseThinking.level), content: reviseThinkContent } });
+              }
+              revisedParsed = parseAIPlanJSON(revisedPlanText);
+              break;
+            } catch (e: any) {
+              if (reviseAttempt < 2) continue;
+            }
           }
-          const revisedParsed = parseAIPlanJSON(revisedPlanText);
+          if (!revisedParsed) {
+            onEvent({ type: "build-error", error: "Plan revision failed \u2014 could not parse revised plan. Please try again." });
+            return;
+          }
           if (revisedParsed?.type === "build" || revisedParsed?.phases) {
             currentPlan = {
               pluginName: revisedParsed.pluginName || currentPlan.pluginName,
@@ -852,7 +881,7 @@ export async function runBuild(params: RunBuildParams): Promise<void> {
     // Update server build status
     try {
       await apiRequest("PATCH", `/api/sessions/${sessionId}`, { buildStatus: "building" });
-    } catch {}
+    } catch { }
 
     // 3. Phase loop
     // Track dynamic file indices per phase for file-reading badges
@@ -871,10 +900,11 @@ export async function runBuild(params: RunBuildParams): Promise<void> {
       let dynamicIdx = phase.files.length; // Dynamic badges start after planned files
       phaseDynamicIndices.set(phaseIdx, dynamicIdx);
 
-      if (fileMemory.size > 0) {
+      // Bug 4: Only offer pre-existing files for context reading, not files created during this build
+      if (preExistingPaths.size > 0) {
         try {
           onEvent({ type: "thinking", message: "Analyzing dependencies..." });
-          const existingPaths = Array.from(fileMemory.keys());
+          const existingPaths = Array.from(preExistingPaths);
           const phaseFileNames = phase.files.map((f) => `- ${f.path}: ${f.description}`).join("\n");
           const readCheckPrompt = `You are AuroraCraft. For this build phase, determine which existing project files need to be read for context.
 
@@ -897,6 +927,9 @@ No text before or after the JSON.`;
           } catch {
             filesToRead = [];
           }
+
+          // Bug 4: Filter out files not in preExistingPaths
+          filesToRead = filesToRead.filter(p => preExistingPaths.has(p));
 
           for (const readPath of filesToRead) {
             if (signal.aborted) throw new Error("Build cancelled");
@@ -1166,7 +1199,7 @@ No text before or after the JSON.`;
     // Update server build status
     try {
       await apiRequest("PATCH", `/api/sessions/${sessionId}`, { buildStatus: "complete" });
-    } catch {}
+    } catch { }
   } catch (e: any) {
     if (e.message === "Build cancelled" || signal.aborted) {
       onEvent({ type: "build-error", error: "Build was cancelled" });
@@ -1176,7 +1209,7 @@ No text before or after the JSON.`;
     // Update server build status on error
     try {
       await apiRequest("PATCH", `/api/sessions/${sessionId}`, { buildStatus: "error" });
-    } catch {}
+    } catch { }
   }
 }
 
@@ -1288,7 +1321,7 @@ export async function resumeBuild(params: ResumeBuildParams): Promise<void> {
       await apiRequest("POST", "/api/token-usage/apply", {
         sessionId, modelId: model.id, inputChars, outputChars, action: "chat",
       });
-    } catch {}
+    } catch { }
   }
 
   function buildProjectContext(currentPhasePaths?: string[]): string {
@@ -1324,7 +1357,7 @@ export async function resumeBuild(params: ResumeBuildParams): Promise<void> {
         fileIdMap.set(f.path, f.id);
       }
     }
-  } catch {}
+  } catch { }
 
   // ── Resume pipeline ──
   try {
@@ -1332,7 +1365,7 @@ export async function resumeBuild(params: ResumeBuildParams): Promise<void> {
 
     try {
       await apiRequest("PATCH", `/api/sessions/${sessionId}`, { buildStatus: "building" });
-    } catch {}
+    } catch { }
 
     for (let phaseIdx = 0; phaseIdx < plan.phases.length; phaseIdx++) {
       if (signal.aborted) throw new Error("Build cancelled");
@@ -1499,7 +1532,7 @@ export async function resumeBuild(params: ResumeBuildParams): Promise<void> {
     onEvent({ type: "build-complete", summary });
     try {
       await apiRequest("PATCH", `/api/sessions/${sessionId}`, { buildStatus: "complete" });
-    } catch {}
+    } catch { }
   } catch (e: any) {
     if (e.message === "Build cancelled" || signal.aborted) {
       onEvent({ type: "build-error", error: "Build was cancelled" });
@@ -1508,7 +1541,7 @@ export async function resumeBuild(params: ResumeBuildParams): Promise<void> {
     }
     try {
       await apiRequest("PATCH", `/api/sessions/${sessionId}`, { buildStatus: "error" });
-    } catch {}
+    } catch { }
   }
 }
 

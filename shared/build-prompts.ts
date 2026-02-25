@@ -34,11 +34,13 @@ export function buildPlanningPrompt(
     ? buildThinkingInstruction(thinkingCtx.typeId, thinkingCtx.level)
     : "";
   let existingContext = "";
-  if (existingFiles?.length) {
+  if (existingFiles && existingFiles.length > 0) {
     existingContext = `\n## EXISTING PROJECT FILES (your memory of the project)\nThe project already has ${existingFiles.length} files. You MUST use this knowledge to make accurate changes — never ask the user for information that is already in these files.\n`;
     for (const f of existingFiles) {
       existingContext += `\n--- ${f.path} ---\n${f.content}\n--- end ---\n`;
     }
+  } else {
+    existingContext = `\n## PROJECT STATE\nThis is a brand new, completely empty project with NO existing files. Design the plugin entirely from scratch. Create all necessary files including pom.xml, plugin.yml, and all source files.\n`;
   }
 
   return `${thinkingBlock}You are AuroraCraft, an expert Minecraft plugin architect specializing in Java 21 and ${frameworkDesc}.

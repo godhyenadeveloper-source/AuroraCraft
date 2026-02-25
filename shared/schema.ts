@@ -100,6 +100,7 @@ export const chatMessages = pgTable("chat_messages", {
   content: text("content").notNull(),
   modelId: integer("model_id").references(() => models.id),
   tokensUsed: integer("tokens_used").default(0),
+  thinkingData: jsonb("thinking_data"), // ThinkingContext JSON — persists AI reasoning alongside the message
   createdAt: timestamp("created_at").defaultNow(),
 });
 
