@@ -4,3 +4,4 @@ dist
 server/public
 vite.config.ts.*
 *.tar.gzgoogle-chrome-stable_current_amd64.deb
+*.deb
