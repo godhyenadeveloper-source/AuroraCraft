@@ -63,6 +63,7 @@ import {
   type BuildEvent,
   type BuildState,
   type BuildPlan,
+  type BuildPhase,
 } from "@/lib/build-engine";
 import type { ChatSession, ChatMessage, Model, ProjectFile, Compilation } from "@shared/schema";
 import { parseStreamingThinking } from "@shared/thinking-parser";
@@ -244,6 +245,60 @@ function FileTreeNode({
       )}
     </div>
   );
+}
+
+// ─── Historical Plan Parser ───────────────────────────────────────────────
+
+/**
+ * Reconstructs a BuildPlan object from the raw markdown saved in the database.
+ * This decouples historical plan rendering from the active build state.
+ */
+function parseHistoricalPlan(content: string): BuildPlan | null {
+  if (!content.startsWith("**Build Plan: ")) return null;
+  try {
+    const lines = content.split('\n');
+    const titleLine = lines[0];
+    const pluginName = titleLine.replace('**Build Plan: ', '').replace('**', '').trim();
+
+    let description = "";
+    let i = 1;
+    while (i < lines.length && !lines[i].startsWith("### ")) {
+      if (lines[i].trim()) description += lines[i] + "\n";
+      i++;
+    }
+
+    const phases: BuildPhase[] = [];
+    let currentPhase: BuildPhase | null = null;
+
+    while (i < lines.length) {
+      const line = lines[i].trim();
+      if (line.startsWith("### ")) {
+        if (currentPhase) phases.push(currentPhase);
+        currentPhase = {
+          name: line.replace('### ', '').trim(),
+          description: '',
+          files: []
+        };
+      } else if (line.startsWith("- ")) {
+        if (currentPhase) {
+          currentPhase.files.push({ name: line.replace('- ', '').trim(), path: '', description: '', status: 'pending' } as any);
+        }
+      } else if (line) {
+        if (currentPhase) currentPhase.description += line + "\n";
+      }
+      i++;
+    }
+    if (currentPhase) phases.push(currentPhase);
+
+    return {
+      pluginName,
+      packageName: "", // Not visible in historical UI anyway
+      description: description.trim(),
+      phases
+    };
+  } catch (e) {
+    return null;
+  }
 }
 
 // ─── Build state persistence helpers ──────────────────────────────────────
@@ -1152,6 +1207,10 @@ export default function ChatPage() {
       const userMessage = message;
       setMessage("");
 
+      const isPuter = selectedModelObj.providerAuthType === "puterjs";
+
+
+
       // Optimistically add user message to cache so it appears immediately
       queryClient.setQueryData<ChatMessage[]>(
         ["/api/sessions", sessionId, "messages"],
@@ -1165,8 +1224,6 @@ export default function ChatPage() {
           createdAt: new Date(),
         } as ChatMessage],
       );
-
-      const isPuter = selectedModelObj.providerAuthType === "puterjs";
 
       // For non-Puter models, use server-side builds (persistent across page close)
       if (!isPuter) {
@@ -1382,59 +1439,94 @@ export default function ChatPage() {
                     </p>
                   </div>
                 ) : (
-                  messages?.filter((msg) => {
-                    // Bug 7: Filter out plan summary message when build plan card is showing
-                    if (buildState.plan && buildState.status !== "idle" &&
-                      msg.role === "assistant" && msg.content.startsWith(`**Build Plan: ${buildState.plan.pluginName}**`)) {
-                      return false;
+                  messages?.map((msg) => {
+                    // Parse historical plan from DB markdown message
+                    const historicalPlan = msg.role === "assistant" ? parseHistoricalPlan(msg.content) : null;
+                    const isPlanMsg = !!historicalPlan;
+
+                    // Detect build summary message — render as styled card inline
+                    const isSummaryMsg = msg.role === "assistant" &&
+                      (msg.content.includes("Build Completion Summary") || msg.content.includes("Quick Change Applied")) &&
+                      msg.content.startsWith("**");
+
+                    if (isPlanMsg && buildState.status !== "idle") {
+                      // During active builds, the plan card is rendered at the bottom of the chat in the active build block.
+                      // To prevent duplicates on page refresh (when the DB message is fetched), we hide the DB message here.
+                      if (buildState.status !== "complete") {
+                        return null;
+                      }
+
+                      return (
+                        <React.Fragment key={msg.id}>
+                          {/* Styled plan card reconstructed from history */}
+                          <BuildPlanMessage
+                            plan={historicalPlan}
+                            showActions={false}
+                            onConfirm={() => { }}
+                            onCancel={() => { }}
+                          />
+                          {/* Phase bubbles reconstructed from history */}
+                          {historicalPlan.phases.map((phase, i) => {
+                            // Historical phases are all completed, so they aren't pending.
+                            return (
+                              <PhaseBubble key={i} phase={{ ...phase, status: "complete" } as any} phaseIndex={i} />
+                            );
+                          })}
+                        </React.Fragment>
+                      );
                     }
-                    // Bug 7: Filter out build completion summary when it's shown as a BuildSummaryMessage card
-                    if (buildState.summary && buildState.status === "complete" &&
-                      msg.role === "assistant" && msg.content === buildState.summary) {
-                      return false;
+
+                    if (isSummaryMsg && (buildState.status === "complete" || buildState.status === "planning")) {
+                      return (
+                        <React.Fragment key={msg.id}>
+                          <BuildSummaryMessage content={buildState.summary!} />
+                        </React.Fragment>
+                      );
                     }
-                    return true;
-                  }).map((msg) => (
-                    <React.Fragment key={msg.id}>
-                      {/* Render per-message thinking from DB thinkingData */}
-                      {msg.role === "assistant" && (msg as any).thinkingData && (
-                        <ThinkingBlock context={(msg as any).thinkingData as any} />
-                      )}
-                      <div
-                        className={`flex gap-3 ${msg.role === "user" ? "justify-end" : ""}`}
-                        data-testid={`message-${msg.id}`}
-                      >
-                        {msg.role === "assistant" && (
-                          <div className="w-8 h-8 rounded-full bg-primary flex items-center justify-center shrink-0">
-                            <Bot className="w-4 h-4 text-primary-foreground" />
-                          </div>
+
+                    // Normal message rendering
+                    return (
+                      <React.Fragment key={msg.id}>
+                        {/* Per-message thinking from DB */}
+                        {msg.role === "assistant" && (msg as any).thinkingData && (
+                          <ThinkingBlock context={(msg as any).thinkingData as any} />
                         )}
                         <div
-                          className={`max-w-[85%] rounded-xl px-4 py-3 ${msg.role === "user"
-                            ? "bg-primary text-primary-foreground"
-                            : "bg-card border border-card-border"
-                            }`}
+                          className={`flex gap-3 ${msg.role === "user" ? "justify-end" : ""}`}
+                          data-testid={`message-${msg.id}`}
                         >
-                          {msg.role === "assistant" ? (
-                            <MarkdownRenderer content={msg.content} className="text-sm" />
-                          ) : (
-                            <p className="text-sm whitespace-pre-wrap">{msg.content}</p>
+                          {msg.role === "assistant" && (
+                            <div className="w-8 h-8 rounded-full bg-primary flex items-center justify-center shrink-0">
+                              <Bot className="w-4 h-4 text-primary-foreground" />
+                            </div>
+                          )}
+                          <div
+                            className={`max-w-[85%] rounded-xl px-4 py-3 ${msg.role === "user"
+                              ? "bg-primary text-primary-foreground"
+                              : "bg-card border border-card-border"
+                              }`}
+                          >
+                            {msg.role === "assistant" ? (
+                              <MarkdownRenderer content={msg.content} className="text-sm" />
+                            ) : (
+                              <p className="text-sm whitespace-pre-wrap">{msg.content}</p>
+                            )}
+                          </div>
+                          {msg.role === "user" && (
+                            <div className="w-8 h-8 rounded-full bg-accent flex items-center justify-center shrink-0">
+                              <User className="w-4 h-4" />
+                            </div>
                           )}
                         </div>
-                        {msg.role === "user" && (
-                          <div className="w-8 h-8 rounded-full bg-accent flex items-center justify-center shrink-0">
-                            <User className="w-4 h-4" />
-                          </div>
-                        )}
-                      </div>
-                    </React.Fragment>
-                  ))
+                      </React.Fragment>
+                    );
+                  })
                 )}
 
-                {/* Build engine UI — phases, badges, progress */}
-                {buildState.plan && buildState.status !== "idle" && (
+                {/* Build engine UI — ONLY during active builds (not complete) */}
+                {buildState.plan && buildState.status !== "idle" && buildState.status !== "complete" && (
                   <>
-                    {/* Bug 5: Render planning thinking blocks BEFORE the plan card */}
+                    {/* Planning thinking blocks */}
                     {buildState.thinkingBlocks
                       .filter(block => block.typeName?.toLowerCase().includes('plan'))
                       .map((block, i) => (
@@ -1477,10 +1569,6 @@ export default function ChatPage() {
                     />
                     {/* Phases render only after plan is confirmed */}
                     {!pendingPlanConfirm && buildState.status !== "awaiting-approval" && buildState.phases.map((phase, i) => {
-                      // Bug 5: Collect thinking blocks for this phase
-                      const phaseThinkingBlocks = buildState.thinkingBlocks.filter(
-                        block => !block.typeName?.toLowerCase().includes('plan') && !block.typeName?.toLowerCase().includes('summary')
-                      );
                       return phase.status !== "pending" && (
                         <PhaseBubble key={i} phase={phase} phaseIndex={i} />
                       );
@@ -1512,19 +1600,7 @@ export default function ChatPage() {
                   />
                 )}
 
-                {/* Bug 5: Render summary thinking blocks before the summary */}
-                {buildState.status === "complete" && buildState.summary && (
-                  <>
-                    {buildState.thinkingBlocks
-                      .filter(block => block.typeName?.toLowerCase().includes('summary') ||
-                        (!block.typeName?.toLowerCase().includes('plan') && buildState.phases.length === 0))
-                      .map((block, i) => (
-                        <ThinkingBlock key={`tb-summary-${i}`} context={block} />
-                      ))
-                    }
-                    <BuildSummaryMessage content={buildState.summary} />
-                  </>
-                )}
+                {/* Summary renders inline with messages — see plan/summary detection in message map */}
 
                 {/* Build error / interrupted */}
                 {buildState.status === "error" && buildState.error && (

@@ -125,6 +125,9 @@ export const INITIAL_BUILD_STATE: BuildState = {
 export function buildReducer(state: BuildState, event: BuildEvent): BuildState {
   switch (event.type) {
     case "planning":
+      if (state.status === "complete") {
+        return { ...INITIAL_BUILD_STATE, status: "planning", thinkingMessage: "Analyzing your request..." };
+      }
       return { ...state, status: "planning", thinkingMessage: "Analyzing your request..." };
 
     case "plan-ready":
@@ -157,8 +160,9 @@ export function buildReducer(state: BuildState, event: BuildEvent): BuildState {
       return INITIAL_BUILD_STATE;
 
     case "quick-change-start":
+      const baseState = state.status === "complete" ? INITIAL_BUILD_STATE : state;
       return {
-        ...state,
+        ...baseState,
         status: "building",
         plan: {
           pluginName: "Quick Change",

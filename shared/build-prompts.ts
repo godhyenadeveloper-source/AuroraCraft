@@ -105,7 +105,9 @@ Use this when the user asks to create/build/make a plugin, add a significant new
 }
 \`\`\`
 
-### 3) CONVERSATION — for questions, greetings, or non-code requests
+### 3) CONVERSATION — STRICTLY for greetings or general questions ONLY
+Use this ONLY if the user is saying hello, asking a generic question not related to the codebase, or if they explicitly ask you NOT to change anything. 
+IF THE USER ASKS TO CHANGE, UPDATE, FIX, OR MODIFY ANYTHING, YOU MUST USE \`quick-change\` OR \`build\` INSTEAD. DO NOT USE \`conversation\` FOR CODE CHANGES.
 \`\`\`json
 {
   "type": "conversation",
